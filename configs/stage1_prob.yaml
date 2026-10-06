@@ -1,0 +1,45 @@
+# Stage-B probabilistic fine-tune (Student-t + von Mises heads).
+seed_everything: 42
+
+trainer:
+  max_epochs: 50
+  accelerator: auto
+  devices: 1
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 4
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val_mismatch
+        mode: min
+        save_top_k: 3
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: logs
+      name: stage1_prob
+
+model:
+  d_model: 512
+  n_layers: 12
+  n_heads: 8
+  n_channels: 1
+  patch_len: 32
+  horizon: 4
+  dropout: 0.05
+  learning_rate: 1.0e-4
+  weight_decay: 0.1
+  lambda_phi: 1.0
+  lambda_coh: 0.1
+  probabilistic: true
+  couple_amplitude: true
+  scheduled_sampling_max: 0.5
+
+data:
+  manifest_path: data/generated/manifest.parquet
+  batch_size: 8
+  num_workers: 4
+  patch_len: 32
+  context_patches: 1
+  compute_stats_if_missing: false

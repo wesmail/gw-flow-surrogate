@@ -1,0 +1,67 @@
+# FM retrain for the E3 fair comparison: 25k data, ~20M trunk (matches the
+# GPT twins' scale), budget ~50k steps (matches twins' schedule).
+# BEFORE RUNNING: re-run compute_residual_scale on the 25k train split and
+# replace residual_scale below — the old value was computed on the 10k set.
+seed_everything: 42
+
+trainer:
+  max_epochs: 140                    # ~360 steps/epoch x 140 ≈ 50k steps ≈ twins' budget
+  accelerator: auto
+  devices: 1
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val_mismatch        # you monitor the metric directly — keep; this is
+        mode: min                    # better than val_loss and the twins should envy it
+        save_top_k: 2
+        save_last: true
+        filename: "{epoch:03d}-{val_mismatch:.4f}"
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: logs
+      name: flow_25k_fair            # CHANGED
+
+model:
+  d_model: 288                       # CHANGED (was 128): ~20M trunk, twins' scale
+  n_layers: 12                       # CHANGED (was 6)
+  n_heads: 8                         # CHANGED (was 4): head_dim 48
+  n_kv_heads: 4                      # CHANGED (was 2): same 2:1 GQA ratio as twins
+  n_channels: 1
+  patch_len: 32
+  n_prefix: 4                        # unchanged — same prefix count as the GPT theta-twin
+  dropout: 0.1                       # CHANGED (was 0.0): bigger model, 25k data;
+                                     # twins use 0.15 on a longer sequence — 0.1 is the analogue
+  grad_ckpt: false
+  head_width: 288                    # CHANGED (was 128): scale flow head with trunk
+  head_depth: 2
+  num_horizons: 4                    # unchanged — matches twins' mtp_depth 3 (+ main)
+  n_sampling_steps: 20
+  loss_on_context: true
+  residual_scale: 0.08166            # <-- compute_residual_scale on the 25k TRAIN split
+  learning_rate: 2.0e-4              # CHANGED (was 3e-4): match twins; larger model
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  warmup_steps: 2000                 # CHANGED (was 500): match twins
+  max_steps: -1
+  min_lr_ratio: 0.1
+  rollout_n_waveforms: 4
+  rollout_n_samples: 1
+  rollout_max_patches: 0
+
+data:
+  manifest_path: ./data/25k/manifest.parquet
+  batch_size: 64                     # seq is only 320 patches — fits easily, even laptop
+  num_workers: 16
+  persistent_workers: true
+  prefetch_factor: 4
+  patch_len: 32
+  context_patches: 1                 # unchanged for TRAINING; eval-time context is set
+                                     # by eval_fm_unified.py --context-fraction
+  compute_stats_if_missing: true

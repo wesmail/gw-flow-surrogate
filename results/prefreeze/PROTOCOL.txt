@@ -1,0 +1,10 @@
+FROZEN EVAL PROTOCOL
+  split=test
+  context-fraction=0.5
+  n-waveforms=500
+  n-samples=1
+  mean-of=4
+  n-steps=40
+  checkpoint=logs/epoch=092-val_mismatch=0.0024.ckpt
+  manifest=data/120k/manifest.parquet
+  NOTE: ALL paper mismatches use first 500 of data/120k test.

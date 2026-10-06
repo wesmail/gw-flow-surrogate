@@ -1,0 +1,50 @@
+# Stage-1 smoke test config — tiny model for pipeline validation.
+seed_everything: 42
+
+trainer:
+  max_epochs: 2
+  accelerator: auto
+  devices: 1
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  log_every_n_steps: 1
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val_mismatch
+        mode: min
+        save_top_k: 1
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: val_mismatch
+        patience: 5
+        mode: min
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: logs
+      name: smoke
+
+model:
+  d_model: 128
+  n_layers: 4
+  n_heads: 4
+  n_channels: 1
+  patch_len: 32
+  horizon: 4
+  dropout: 0.0
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  lambda_phi: 1.0
+  lambda_coh: 0.1
+  probabilistic: false
+  couple_amplitude: false
+  scheduled_sampling_max: 0.0
+
+data:
+  manifest_path: data/smoke/manifest.parquet
+  batch_size: 2
+  num_workers: 0
+  patch_len: 32
+  context_patches: 1
+  compute_stats_if_missing: true
