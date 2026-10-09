@@ -21,6 +21,10 @@ figs/
 paper_figs/out/
 results/*.csv
 !results/prefreeze/
+results/scale_study/
+
+# Scale-study local protocol (keep the .example committed)
+scripts/scale_study/PROTOCOL.env
 
 # Archives / personal
 *.zip

@@ -1,0 +1,14 @@
+# Catalog of the eight trainings before the target run.
+# Columns: run_id  n_train  config  model_tag  phase  notes
+# phase=scaling  → data-scaling grid (fit power law; 300k is held out until prediction is written)
+# phase=capacity → model-size probe at 120k
+# phase=heldout  → 300k check of the power-law prediction (run AFTER writing prediction.json)
+run_id	n_train	config	model_tag	phase	notes
+6k_2p5m	6000	configs/scale_2p5m.yaml	2p5m	scaling	start here
+12k_2p5m	12000	configs/scale_2p5m.yaml	2p5m	scaling	
+25k_2p5m	25000	configs/scale_2p5m.yaml	2p5m	scaling	
+50k_2p5m	50000	configs/scale_2p5m.yaml	2p5m	scaling	
+120k_2p5m	120000	configs/scale_2p5m.yaml	2p5m	scaling	
+120k_0p6m	120000	configs/scale_0p6m.yaml	0p6m	capacity	parallel OK with scaling
+120k_10m	120000	configs/scale_10m.yaml	10m	capacity	parallel OK with scaling
+300k_2p5m	300000	configs/scale_2p5m.yaml	2p5m	heldout	ONLY after prediction.json exists

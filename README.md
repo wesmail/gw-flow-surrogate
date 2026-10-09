@@ -338,6 +338,11 @@ python paper_figs/fig_speed_frontier.py plot results/speed_frontier.csv
 
 ## 8. Scaling law and estimating training data size
 
+**Preferred path (automated):** the full nested-pool study (300k generate → freeze norms →
+eight trainings → power-law gate → decision figure) lives in
+[`scripts/scale_study/README.md`](scripts/scale_study/README.md).
+Use that for the \(10^{-4}\) target study. The manual notes below remain as a short reference.
+
 **Needs:** Steps 2–6 repeated at **several** training-set sizes (same model size, same frozen eval protocol). Typical points: **6k → 25k → 120k** train waveforms.
 
 Goal: measure how median mismatch scales with $N$, then use that law to decide how much data you need for a target accuracy (e.g. $10^{-3}$).

@@ -1,0 +1,71 @@
+# Scale-study baseline: ~3.1M params (paper label "2.5M").
+# Same hyperparameters + EarlyStopping for every N in the data-scaling grid.
+seed_everything: 42
+
+trainer:
+  max_epochs: 500
+  accelerator: auto
+  devices: 1
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: val_mismatch
+        mode: min
+        save_top_k: 2
+        save_last: true
+        filename: "{epoch:03d}-{val_mismatch:.4f}"
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: val_mismatch
+        patience: 25
+        mode: min
+        min_delta: 0.0
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: logs/scale_study
+      name: PLACEHOLDER  # overridden per run
+
+model:
+  d_model: 128
+  n_layers: 6
+  n_heads: 4
+  n_kv_heads: 2
+  n_channels: 1
+  patch_len: 32
+  n_prefix: 4
+  dropout: 0.0
+  grad_ckpt: false
+  head_width: 128
+  head_depth: 2
+  num_horizons: 4
+  n_sampling_steps: 20
+  loss_on_context: true
+  residual_scale: 0.082  # overwritten by train scripts from frozen protocol
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  warmup_steps: 500
+  max_steps: -1
+  min_lr_ratio: 0.1
+  rollout_n_waveforms: 4
+  rollout_n_samples: 1
+  rollout_max_patches: 0
+
+data:
+  manifest_path: ./data/scale300k/manifest_train_6000.parquet  # overridden per run
+  norm_stats_path: ./data/scale300k/norm_stats.npz
+  batch_size: 64
+  num_workers: 8
+  persistent_workers: true
+  prefetch_factor: 4
+  patch_len: 32
+  context_patches: 1
+  compute_stats_if_missing: false
+  norm_stats_max_samples: 0
