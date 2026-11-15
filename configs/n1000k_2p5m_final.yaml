@@ -1,0 +1,79 @@
+# Final recipe, 1M flagship trained from scratch (~3.1M params, paper label "2.5M").
+# 41 epochs x 7813 steps = 320,333 steps: the cosine schedule ends exactly on an epoch boundary.
+# The evaluated model is ALWAYS the end-of-schedule last.ckpt (no early stopping).
+seed_everything: 42
+
+trainer:
+  max_steps: 320333
+  max_epochs: -1
+  accelerator: gpu
+  devices: 1
+  precision: bf16-mixed
+  gradient_clip_val: 1.0
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint   # best by the quick monitor (info only)
+      init_args:
+        monitor: val_mismatch
+        mode: min
+        save_top_k: 1
+        save_last: false
+        filename: "best-{epoch:03d}-{val_mismatch:.4f}"
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint   # every epoch -> true last.ckpt
+      init_args:
+        every_n_epochs: 1
+        save_top_k: -1           # keep all epochs (enables weight averaging)
+        save_last: true
+        filename: "epoch-{epoch:03d}"
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: logs/scale_study
+      name: n1000k_2p5m_final
+
+model:
+  d_model: 128
+  n_layers: 6
+  n_heads: 4
+  n_kv_heads: 2
+  n_channels: 1
+  patch_len: 32
+  n_prefix: 4
+  dropout: 0.0
+  grad_ckpt: false
+  head_width: 128
+  head_depth: 2
+  num_horizons: 4
+  n_sampling_steps: 20
+  loss_on_context: true
+  residual_scale: 0.08152        # from compute_residual_scale on data/n1000k
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  warmup_steps: 500
+  max_steps: 320333              # = trainer.max_steps
+  min_lr_ratio: 0.1
+  dphi_weight: 30.0              # final recipe: phase advance weighted
+  la_weight: 10.0                # final recipe: log-amplitude weighted
+  amp_mode: pchip                # validation reconstruction only
+  rollout_n_waveforms: 32
+  rollout_n_samples: 1
+  rollout_mean_of: 4
+  rollout_max_patches: 0
+
+data:
+  manifest_path: ./data/n1000k/manifest.parquet
+  norm_stats_path: ./data/n1000k/norm_stats.npz
+  batch_size: 128
+  num_workers: 0
+  persistent_workers: false
+  prefetch_factor: 2
+  patch_len: 32
+  context_patches: 1
+  compute_stats_if_missing: false
+  norm_stats_max_samples: 0
+  preload: false
+  max_cached_shards: 2

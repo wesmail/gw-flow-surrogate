@@ -113,23 +113,36 @@ def evaluate_batch(lit: GWFlowSurrogateLit, batch: dict, n_samples: int,
   dp_s0 = dp_s[:, 0] if dp_s.ndim == 2 else dp_s          # (B,) channel 0
 
   # ---- ground truth (physical) ------------------------------------------ #
+  # Full sequence then slice so amp_mode interp sees left-neighbour patches.
   la_t = batch["log_a"][:, ctx:ctx + n_gen, 0]
   dp_t = batch["delta_phi"][:, ctx:ctx + n_gen, 0]
   res_t = batch["phi_residual"][:, ctx:ctx + n_gen, 0]
-  h_true = lit._reconstruct_waveform(la_t, dp_t, res_t, la_m, la_s, dp_m, dp_s, P)
+  h_true = lit._reconstruct_waveform(
+    batch["log_a"][:, : ctx + n_gen, 0],
+    batch["delta_phi"][:, : ctx + n_gen, 0],
+    batch["phi_residual"][:, : ctx + n_gen, 0],
+    la_m, la_s, dp_m, dp_s, P,
+  )[:, ctx * P :]
 
   # ---- free rollout ------------------------------------------------------ #
   gen = lit.model.generate(feat[:, :ctx], batch["theta"], n_gen,
                            n_steps=n_steps, n_samples=n_samples,
                            temperature=temperature, mean_of=mean_of)
   la_g, dp_g, res_g = lit._split_features(gen, C, P)      # (B, S, n_gen, C[, P])
+  la_seed = batch["log_a"][:, :ctx, 0]
+  dp_seed = batch["delta_phi"][:, :ctx, 0]
+  res_seed = batch["phi_residual"][:, :ctx, 0]
 
   mism = torch.zeros(B, n_samples)
   rel_l2 = torch.zeros(B, n_samples)
   h_pred0 = None
   for s in range(n_samples):
-    h_p = lit._reconstruct_waveform(la_g[:, s, :, 0], dp_g[:, s, :, 0],
-                                    res_g[:, s, :, 0], la_m, la_s, dp_m, dp_s, P)
+    h_p = lit._reconstruct_waveform(
+      torch.cat([la_seed, la_g[:, s, :, 0]], dim=1),
+      torch.cat([dp_seed, dp_g[:, s, :, 0]], dim=1),
+      torch.cat([res_seed, res_g[:, s, :, 0]], dim=1),
+      la_m, la_s, dp_m, dp_s, P,
+    )[:, ctx * P :]
     if s == 0:
       h_pred0 = h_p
     inner = (h_p * h_true.conj()).sum(dim=1)
@@ -222,32 +235,80 @@ def plot_waveform(i: int, r: dict, b: int, t: np.ndarray, P: int, out: Path) -> 
 
 
 def main() -> None:
+  import sys as _sys
+  from paper_figs.protocol_utils import (
+    assert_not_identity_stats,
+    context_patches_from_fraction,
+    enforce_protocol,
+    load_protocol,
+    resolve_norm_stats,
+    write_sidecar,
+  )
+
+  use_proto = "--protocol" in _sys.argv
   ap = argparse.ArgumentParser(description=__doc__,
                                formatter_class=argparse.RawDescriptionHelpFormatter)
   ap.add_argument("--checkpoint", required=True)
-  ap.add_argument("--manifest", required=True)
-  ap.add_argument("--split", default="test", help="test | val | train | ood")
+  ap.add_argument("--manifest", default=None, required=not use_proto)
+  ap.add_argument("--split", default=None if use_proto else "test", help="test | val | train | ood")
   ap.add_argument("--norm-stats", default=None,
-                  help="default: <manifest dir>/norm_stats.npz")
-  ap.add_argument("--n-waveforms", type=int, default=128)
-  ap.add_argument("--n-samples", type=int, default=4, help="flow samples per waveform")
+                  help="training norm_stats.npz (never the test-folder default under --protocol)")
+  ap.add_argument("--n-waveforms", type=int, default=None if use_proto else 128)
+  ap.add_argument("--n-samples", type=int, default=None if use_proto else 4,
+                  help="flow samples per waveform")
   ap.add_argument("--n-steps", type=int, default=None,
-                  help="Euler steps (default: training value)")
+                  help="Euler steps (default: training value / protocol)")
   ap.add_argument("--limit-patches", type=int, default=0, help="cap rollout length (0=full)")
   # [ITEM 4] default None keeps every existing command line bit-identical
   # (context_patches=1). When set, seed max(1, int(frac * n_patches)) patches.
   ap.add_argument("--context-fraction", type=float, default=None,
                   help="fraction of patches to seed (default: None => context_patches=1)")
-  ap.add_argument("--temperature", type=float, default=1.0,
+  ap.add_argument("--temperature", type=float, default=None if use_proto else 1.0,
                   help="flow initial-noise scale (0 = deterministic ODE)")
-  ap.add_argument("--mean-of", type=int, default=1,
+  ap.add_argument("--mean-of", type=int, default=None if use_proto else 1,
                   help="average K head samples per fed-back patch")
-  ap.add_argument("--batch-size", type=int, default=16)
+  ap.add_argument("--batch-size", type=int, default=None if use_proto else 16)
   ap.add_argument("--n-plot", type=int, default=4)
   ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   ap.add_argument("--output-dir", default="eval_out")
   ap.add_argument("--allow-identity-stats", action="store_true")
+  ap.add_argument("--amp-mode", default=None if use_proto else "constant",
+                  choices=("constant", "linear", "pchip"),
+                  help="amplitude reconstruction rule (default: constant = legacy)")
+  ap.add_argument("--seed", type=int, default=None if use_proto else 0)
+  ap.add_argument("--protocol", default=None)
+  ap.add_argument("--override", action="store_true")
   args = ap.parse_args()
+
+  protocol = None
+  overrides = {}
+  if args.protocol:
+    protocol = load_protocol(args.protocol)
+    if not hasattr(args, "manifest") or args.manifest is None:
+      args.manifest = None
+    overrides = enforce_protocol(args, protocol, override=args.override)
+    if args.n_waveforms is None:
+      args.n_waveforms = int(protocol["n_waveforms_flagship"])
+    if args.manifest is None:
+      args.manifest = protocol["test_manifest"]
+    if args.split is None:
+      args.split = protocol["split"]
+    if args.n_steps is None:
+      args.n_steps = int(protocol["n_steps"])
+    if args.amp_mode is None:
+      args.amp_mode = protocol["amp_mode"]
+    if args.mean_of is None:
+      args.mean_of = int(protocol["mean_of"])
+    if args.n_samples is None:
+      args.n_samples = int(protocol["n_samples"])
+    if args.temperature is None:
+      args.temperature = float(protocol["temperature"])
+    if args.batch_size is None:
+      args.batch_size = int(protocol["batch_size"])
+    if args.seed is None:
+      args.seed = int(protocol["seed"])
+    if args.context_fraction is None:
+      args.context_fraction = float(protocol["context_fraction"])
 
   device = torch.device(args.device)
   out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
@@ -260,12 +321,19 @@ def main() -> None:
     lit = GWFlowSurrogateLit.load_from_checkpoint(
       args.checkpoint, map_location=device, use_abs_time=False
     )
+  lit.hparams.amp_mode = args.amp_mode
   lit.eval().to(device)
   n_steps = args.n_steps or lit.hparams.n_sampling_steps
   P = lit.hparams.patch_len
 
   manifest = Path(args.manifest)
-  stats_path = args.norm_stats or str(manifest.parent / "norm_stats.npz")
+  try:
+    stats_path = resolve_norm_stats(args.checkpoint, args.norm_stats)
+  except FileNotFoundError:
+    if args.allow_identity_stats and not args.protocol:
+      stats_path = Path(args.norm_stats) if args.norm_stats else (manifest.parent / "norm_stats.npz")
+    else:
+      raise
   if not Path(stats_path).is_file() and not args.allow_identity_stats:
     raise FileNotFoundError(
       f"{stats_path} not found — evaluation with identity stats does not match "
@@ -275,6 +343,8 @@ def main() -> None:
     manifest, split=args.split, patch_len=P,
     context_patches=1, norm_stats_path=stats_path, preload=False,
   )
+  if not args.allow_identity_stats:
+    assert_not_identity_stats(ds_probe.norm_stats, path=stats_path)
   n_patches = n_patches_for(ds_probe.n_time, P)
   # [ITEM 4] default None keeps every existing command line bit-identical
   # (θ-only seed). Opt-in fraction selects a longer context for forecasting.
@@ -282,7 +352,7 @@ def main() -> None:
     ctx_patches = 1
     ctx_frac_reported = None
   else:
-    ctx_patches = max(1, int(round(args.context_fraction * n_patches)))
+    ctx_patches = context_patches_from_fraction(n_patches, float(args.context_fraction))
     ctx_frac_reported = float(args.context_fraction)
   n_gen_patches = n_patches - ctx_patches
   # [ITEM 4] Announce the protocol so numbers are never quoted across tasks.
@@ -292,7 +362,8 @@ def main() -> None:
 
   ds = WaveformPatchDataset(
     manifest, split=args.split, patch_len=P,
-    context_patches=ctx_patches, norm_stats_path=stats_path, preload=True,
+    context_patches=ctx_patches, norm_stats_path=stats_path,
+    preload=True, share_memory=False,
   )
   n_eval = min(args.n_waveforms, len(ds))
   t_grid = load_time_grid(manifest, ds.n_time)
@@ -330,6 +401,7 @@ def main() -> None:
     "split": args.split, "n_waveforms": int(n_eval),
     "n_samples": args.n_samples, "n_steps": int(n_steps),
     "temperature": args.temperature, "mean_of": args.mean_of,
+    "amp_mode": args.amp_mode,
     # [ITEM 4] Record protocol so metrics.json is self-describing across tasks.
     "context_patches": int(ctx_patches),
     "context_fraction": ctx_frac_reported,
@@ -343,9 +415,23 @@ def main() -> None:
     "tf_to_rollout_dphi_ratio": float(d_ro.mean() / max(d_tf.mean(), 1e-12)),
     "amp_rel_err_median": q(amp, 0.5),
     "final_phase_drift_rad_median": q(drift[:, -1], 0.5),
+    "protocol": protocol,
+    "overrides": overrides,
+    "protocol_sha256": (protocol or {}).get("_protocol_sha256"),
   }
   (out / "metrics.json").write_text(json.dumps(summary, indent=2))
   print(json.dumps(summary, indent=2))
+  if protocol is not None:
+    write_sidecar(
+      out / "per_waveform.csv",
+      checkpoint=args.checkpoint,
+      norm_stats=stats_path,
+      manifest=manifest,
+      protocol=protocol,
+      overrides=overrides,
+      extra={"amp_mode": args.amp_mode, "n_steps": int(n_steps)},
+      device=str(device),
+    )
 
   header = "q,chi1z,chi2z,mismatch_mean,mismatch_best,rel_l2,final_drift_rad"
   rows = [f"{theta[i,0]:.4f},{theta[i,1]:.4f},{theta[i,2]:.4f},"

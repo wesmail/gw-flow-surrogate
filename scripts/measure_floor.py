@@ -50,24 +50,60 @@ def phase_opt_mismatch(h1: torch.Tensor, h2: torch.Tensor) -> torch.Tensor:
 
 
 def main() -> None:
+  use_proto = "--protocol" in sys.argv
   ap = argparse.ArgumentParser(description=__doc__,
                                formatter_class=argparse.RawDescriptionHelpFormatter)
-  ap.add_argument("--manifest", required=True)
-  ap.add_argument("--split", default="test")
-  ap.add_argument("--n-waveforms", type=int, default=200)
+  ap.add_argument("--manifest", default=None, required=not use_proto)
+  ap.add_argument("--split", default=None if use_proto else "test")
+  ap.add_argument("--n-waveforms", type=int,
+                  default=None if use_proto else 200)
   ap.add_argument("--patch-len", type=int, default=32)
-  ap.add_argument("--batch-size", type=int, default=16)
+  ap.add_argument("--batch-size", type=int, default=None if use_proto else 16)
   ap.add_argument("--checkpoint", default=None,
                   help="If set, also measure end-to-end + token-space mismatch")
-  ap.add_argument("--n-steps", type=int, default=20)
+  ap.add_argument("--n-steps", type=int, default=None if use_proto else 20)
+  ap.add_argument("--amp-mode", default=None, choices=("constant", "linear", "pchip"))
+  ap.add_argument("--seed", type=int, default=None if use_proto else 1234)
+  ap.add_argument("--protocol", default=None)
+  ap.add_argument("--override", action="store_true")
   ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   ap.add_argument("--out", default="floor_metrics.json")
   args = ap.parse_args()
+  if args.protocol:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "paper_figs"))
+    from protocol_utils import enforce_protocol, load_protocol
+    proto = load_protocol(args.protocol)
+    enforce_protocol(args, proto, override=args.override)
+    if args.manifest is None:
+      args.manifest = proto["test_manifest"]
+    if args.split is None:
+      args.split = proto["split"]
+    if args.amp_mode is None:
+      args.amp_mode = proto["amp_mode"]
+    if args.n_waveforms is None:
+      args.n_waveforms = int(proto["n_waveforms_flagship"])
+    if args.batch_size is None:
+      args.batch_size = int(proto["batch_size"])
+    if args.n_steps is None:
+      args.n_steps = int(proto["n_steps"])
+    if args.seed is None:
+      args.seed = int(proto["seed"])
+  elif args.amp_mode is None:
+    args.amp_mode = "constant"
 
   device = torch.device(args.device)
   P = args.patch_len
   manifest = Path(args.manifest)
-  stats_path = manifest.parent / "norm_stats.npz"
+  # Prefer checkpoint hparams / --norm-stats when a checkpoint is provided.
+  if args.checkpoint:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "paper_figs"))
+    from protocol_utils import resolve_norm_stats
+    try:
+      stats_path = resolve_norm_stats(args.checkpoint, None)
+    except FileNotFoundError:
+      stats_path = manifest.parent / "norm_stats.npz"
+  else:
+    stats_path = manifest.parent / "norm_stats.npz"
 
   # [ITEM 2] Raw tracks; patchify happens locally so floor does not depend on
   # training normalisation. residual_scale=1.0 + identity norms below.
@@ -84,7 +120,9 @@ def main() -> None:
   # [ITEM 2] Floor reconstructor: identity stats + residual_scale=1.0 so physical
   # tokens from patchify_tracks_batched pass through unscaled — this is the
   # *exact* _reconstruct_waveform code path used at evaluation time.
-  lit_floor = GWFlowSurrogateLit(patch_len=P, residual_scale=1.0, n_channels=1)
+  lit_floor = GWFlowSurrogateLit(
+    patch_len=P, residual_scale=1.0, n_channels=1, amp_mode=args.amp_mode,
+  )
   lit_floor.eval()
 
   lit_model = None
@@ -98,6 +136,7 @@ def main() -> None:
       lit_model = GWFlowSurrogateLit.load_from_checkpoint(
         args.checkpoint, map_location=device, use_abs_time=False
       )
+    lit_model.hparams.amp_mode = args.amp_mode
     lit_model.eval().to(device)
     P = lit_model.hparams.patch_len
 
@@ -150,24 +189,13 @@ def main() -> None:
       la_s = batch_dev["norm_log_a_std"]
       dp_m = batch_dev["norm_dphi_mean"]
       dp_s = batch_dev["norm_dphi_std"]
-      h_pred = lit_model._reconstruct_waveform(
-        la_g[:, :, 0], dp_g[:, :, 0], res_g[:, :, 0],
+      # Full-sequence reconstruct (seed + gen) so amp_mode sees left neighbours.
+      h_e2e = lit_model._reconstruct_waveform(
+        torch.cat([batch_dev["log_a"][:, :ctx, 0], la_g[:, :, 0]], dim=1),
+        torch.cat([batch_dev["delta_phi"][:, :ctx, 0], dp_g[:, :, 0]], dim=1),
+        torch.cat([batch_dev["phi_residual"][:, :ctx, 0], res_g[:, :, 0]], dim=1),
         la_m, la_s, dp_m, dp_s, P,
       ).to(torch.complex128)
-
-      # Full-waveform e2e: concat true seed samples + predicted future.
-      # Seed region uses the true reconstruction (ground truth by construction);
-      # compare the generated region + seed against h_orig over usable length.
-      h_true_full = lit_model._reconstruct_waveform(
-        batch_dev["log_a"][:, :, 0],
-        batch_dev["delta_phi"][:, :, 0],
-        batch_dev["phi_residual"][:, :, 0],
-        la_m, la_s, dp_m, dp_s, P,
-      ).to(torch.complex128)
-      # Build hybrid: true tokens for context, predicted for future.
-      seed_samp = ctx * P
-      h_e2e = torch.cat([h_true_full[:, :seed_samp], h_pred], dim=1)
-      # Truncate/pad to usable if needed (should already match n_pat * P).
       if h_e2e.shape[1] > usable:
         h_e2e = h_e2e[:, :usable]
       elif h_e2e.shape[1] < usable:
@@ -176,14 +204,17 @@ def main() -> None:
 
       e2e.append(phase_opt_mismatch(h_orig.to(device), h_e2e).cpu().numpy())
 
-      # Token-space: both sides from reconstruction (floor-free scaling metric).
-      h_true_gen = lit_model._reconstruct_waveform(
-        batch_dev["log_a"][:, ctx:, 0],
-        batch_dev["delta_phi"][:, ctx:, 0],
-        batch_dev["phi_residual"][:, ctx:, 0],
+      # Token-space: both sides from full reconstruction, then slice generated region.
+      h_true_full = lit_model._reconstruct_waveform(
+        batch_dev["log_a"][:, :, 0],
+        batch_dev["delta_phi"][:, :, 0],
+        batch_dev["phi_residual"][:, :, 0],
         la_m, la_s, dp_m, dp_s, P,
       ).to(torch.complex128)
-      tok.append(phase_opt_mismatch(h_true_gen, h_pred).cpu().numpy())
+      seed_samp = ctx * P
+      tok.append(phase_opt_mismatch(
+        h_true_full[:, seed_samp:], h_e2e[:, seed_samp:],
+      ).cpu().numpy())
 
   floor_arr = np.concatenate(floors)
   def stats(a: np.ndarray) -> dict:
@@ -197,6 +228,7 @@ def main() -> None:
     "n_waveforms": int(n),
     "patch_len": int(P),
     "split": args.split,
+    "amp_mode": args.amp_mode,
   }
   Path(args.out).write_text(json.dumps(out, indent=2))
   print(json.dumps(out, indent=2))

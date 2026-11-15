@@ -29,6 +29,7 @@ import torch
 from lightning.pytorch import LightningModule
 
 from datasets.patchify import build_token_features_batched, patchify_tracks_batched
+from models.amp_interp import AMP_MODES, log_amp_per_sample
 from models.surrogate import GWFlowSurrogateModel
 
 
@@ -68,8 +69,13 @@ class GWFlowSurrogateLit(LightningModule):
     rollout_temperature: float = 1.0,
     rollout_mean_of: int = 1,
     use_abs_time: bool = True,
+    amp_mode: str = "constant",
+    la_weight: float = 1.0,         # loss weight of the log-amplitude feature
+    dphi_weight: float = 1.0,       # loss weight of the phase-advance feature
   ) -> None:
     super().__init__()
+    if amp_mode not in AMP_MODES:
+      raise ValueError(f"amp_mode must be one of {AMP_MODES}, got {amp_mode!r}")
     self.save_hyperparameters()
 
     feat_dim = GWFlowSurrogateModel.feature_dim(n_channels, patch_len)
@@ -124,6 +130,47 @@ class GWFlowSurrogateLit(LightningModule):
   # ------------------------------------------------------------------ #
   # Flow-matching loss (single batched head call over all horizons)     #
   # ------------------------------------------------------------------ #
+  # ------------------------------------------------------------------ #
+  # Per-feature loss weights                                            #
+  # ------------------------------------------------------------------ #
+  def _feature_weights(self, D: int, device, dtype):
+    """Weight per token feature, or None when every weight is 1.
+
+    Token layout per channel c (channel-major, see _split_features):
+      c*(2+P)+0 : log-amplitude (patch mean)
+      c*(2+P)+1 : phase advance delta-phi
+      c*(2+P)+2 .. c*(2+P)+P+1 : phase residuals
+    The weighted loss is normalised by the mean weight, so its size stays
+    comparable to the unweighted loss; only the balance between features
+    changes.  In flow matching the per-feature optimum (the conditional mean
+    velocity) does not depend on these weights; they only decide which errors
+    the network reduces first when it cannot reduce all of them.
+    """
+    la_w = float(getattr(self.hparams, "la_weight", 1.0))
+    dp_w = float(getattr(self.hparams, "dphi_weight", 1.0))
+    if la_w == 1.0 and dp_w == 1.0:
+      return None
+    C, P = int(self.hparams.n_channels), int(self.hparams.patch_len)
+    if D != C * (2 + P):
+      raise ValueError(f"feature dim {D} != n_channels*(2+patch_len) = {C * (2 + P)}")
+    w = torch.ones(D, device=device, dtype=dtype)
+    for c in range(C):
+      w[c * (2 + P) + 0] = la_w
+      w[c * (2 + P) + 1] = dp_w
+    return w
+
+  def _log_feature_losses(self, sq: torch.Tensor, stage: str, batch_size: int) -> None:
+    """Unweighted mean squared velocity error per feature group (for monitoring)."""
+    C, P = int(self.hparams.n_channels), int(self.hparams.patch_len)
+    parts = sq.view(sq.shape[0], C, 2 + P)
+    on_step = stage == "train"
+    self.log(f"{stage}_loss_la", parts[..., 0].mean(), on_step=on_step, on_epoch=True,
+             batch_size=batch_size)
+    self.log(f"{stage}_loss_dphi", parts[..., 1].mean(), on_step=on_step, on_epoch=True,
+             batch_size=batch_size)
+    self.log(f"{stage}_loss_res", parts[..., 2:].mean(), on_step=on_step, on_epoch=True,
+             batch_size=batch_size)
+
   def _flow_loss(self, batch: dict[str, torch.Tensor], stage: str) -> torch.Tensor:
     batch = self._patchify_batch(batch)
     feat = batch["token_features"]                       # (B, N, D)
@@ -152,7 +199,13 @@ class GWFlowSurrogateLit(LightningModule):
     x_tau = (1 - tau[:, None]) * x0 + tau[:, None] * tgt
     v_star = tgt - x0
     v_pred = self.model.head(x_tau, tau, cond)
-    loss = (v_pred - v_star).pow(2).mean()
+    sq = (v_pred - v_star).pow(2)                        # (M, D)
+    w = self._feature_weights(sq.shape[-1], sq.device, sq.dtype)
+    if w is None:                                        # all weights 1: old loss, unchanged
+      loss = sq.mean()
+    else:
+      loss = (sq * w).sum(-1).mean() / w.mean() / sq.shape[-1]
+    self._log_feature_losses(sq.detach(), stage, feat.shape[0])
 
     self.log(f"{stage}_loss", loss, prog_bar=True,
              on_step=(stage == "train"), on_epoch=True,
@@ -182,7 +235,11 @@ class GWFlowSurrogateLit(LightningModule):
     patch_len: int,
   ) -> torch.Tensor:
     """h = A e^{-i phi} at sample resolution, physical units, fp32.
-    Amplitude is patch-constant (the representation stores a patch mean)."""
+
+    Phase: exact by construction (patch-start phase + linear ramp + residual).
+    Amplitude: patch-mean log_a expanded by ``hparams.amp_mode``
+    (``constant`` / ``linear`` / ``pchip``); see ``models.amp_interp``.
+    """
     la_n, dphi_n = la_n.float(), dphi_n.float()
     res = res_n.float() * self.hparams.residual_scale
     la_m = self._norm_broadcast(la_m); la_s = self._norm_broadcast(la_s)
@@ -194,7 +251,9 @@ class GWFlowSurrogateLit(LightningModule):
     # Vectorized over patches: boundary phase by cumulative sum (fp32).
     bnd = torch.cumsum(dphi_rad, dim=1) - dphi_rad                     # (B, n) phase at patch start
     phase = bnd[:, :, None] + s[None, None, :] * dphi_rad[:, :, None] + res
-    amp = torch.exp(la_phys)[:, :, None]
+    amp_mode = getattr(self.hparams, "amp_mode", "constant")
+    la_t = log_amp_per_sample(la_phys, patch_len, amp_mode)           # (B, n*P)
+    amp = torch.exp(la_t).view(B, n, patch_len)
     return (amp * torch.exp(-1j * phase)).reshape(B, n * patch_len)
 
   @torch.no_grad()
@@ -226,19 +285,25 @@ class GWFlowSurrogateLit(LightningModule):
     la_m = batch["norm_log_a_mean"][:W]; la_s = batch["norm_log_a_std"][:W]
     dp_m = batch["norm_dphi_mean"][:W]; dp_s = batch["norm_dphi_std"][:W]
 
+    # Full sequence then slice generated samples so amp interp sees left neighbours.
+    la_t_full = batch["log_a"][:W, : ctx + n_gen, 0]
+    dp_t_full = batch["delta_phi"][:W, : ctx + n_gen, 0]
+    res_t_full = batch["phi_residual"][:W, : ctx + n_gen, 0]
     h_true = self._reconstruct_waveform(
-      batch["log_a"][:W, ctx:ctx + n_gen, 0],
-      batch["delta_phi"][:W, ctx:ctx + n_gen, 0],
-      batch["phi_residual"][:W, ctx:ctx + n_gen, 0],
-      la_m, la_s, dp_m, dp_s, P,
-    )                                                    # (W, T)
+      la_t_full, dp_t_full, res_t_full, la_m, la_s, dp_m, dp_s, P,
+    )[:, ctx * P :]
 
+    la_seed = batch["log_a"][:W, :ctx, 0]
+    dp_seed = batch["delta_phi"][:W, :ctx, 0]
+    res_seed = batch["phi_residual"][:W, :ctx, 0]
     mismatches = []
     for s_idx in range(S):
+      la_full = torch.cat([la_seed, la_g[:, s_idx, :, 0]], dim=1)
+      dp_full = torch.cat([dp_seed, dphi_g[:, s_idx, :, 0]], dim=1)
+      res_full = torch.cat([res_seed, res_g[:, s_idx, :, 0]], dim=1)
       h_pred = self._reconstruct_waveform(
-        la_g[:, s_idx, :, 0], dphi_g[:, s_idx, :, 0], res_g[:, s_idx, :, 0],
-        la_m, la_s, dp_m, dp_s, P,
-      )
+        la_full, dp_full, res_full, la_m, la_s, dp_m, dp_s, P,
+      )[:, ctx * P :]
       num = torch.abs((h_pred * h_true.conj()).sum(dim=1))
       den = torch.sqrt(
         (h_pred.abs() ** 2).sum(1) * (h_true.abs() ** 2).sum(1)
@@ -300,9 +365,25 @@ class GWFlowSurrogateLit(LightningModule):
 def compute_residual_scale(datamodule, patch_len: int, n_batches: int = 8) -> float:
   """One-off helper: std of the de-ramped phase residual over a few train
   batches.  Set model.residual_scale to this value in the config."""
+  from torch.utils.data import DataLoader
+
+  from datasets.datamodule import _collate_batch
+
   datamodule.setup("fit")
+  ds = datamodule.train_ds
+  # Shuffled train_dataloader thrash-loads many full shards; for this probe
+  # walk the split in order so only the first shard(s) are touched.
+  if not ds.preload and not ds.max_cached_shards:
+    ds.max_cached_shards = 2
+  loader = DataLoader(
+    ds,
+    batch_size=int(datamodule.hparams.batch_size),
+    shuffle=False,
+    num_workers=0,
+    collate_fn=_collate_batch,
+  )
   sq, n = 0.0, 0
-  for i, b in enumerate(datamodule.train_dataloader()):
+  for i, b in enumerate(loader):
     p = patchify_tracks_batched(b["log_a_track"], b["phi_track"], patch_len)
     r = p["phi_residual"]
     sq += float((r ** 2).sum()); n += r.numel()

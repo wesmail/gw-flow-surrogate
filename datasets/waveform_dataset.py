@@ -10,14 +10,15 @@ Design (rewritten):
   tracks plus metadata.  No HDF5, no Python patch loop, no normalization on the
   CPU worker.  Patchify + normalize + feature-build happen once per batch on the
   GPU (see ``on_after_batch_transfer`` in the LightningModule).
-* Generalizable to any N: ``preload=False`` switches to a bounded shard cache
-  that still reads a whole shard once and serves many rows from it, with
-  ``max_cached_shards`` capping memory.  For datasets far beyond RAM, regenerate
-  uncompressed + contiguous and memory-map instead (see notes).
+* Generalizable to any N: ``preload=False`` keeps an LRU of *decoded* shards
+  (``max_cached_shards`` caps RAM).  Pair with ``ShardGroupedSampler`` so the
+  loader finishes one shard before opening the next — random shuffle across
+  shards thrash-loads and is unusable on large pools.
 """
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 
@@ -25,9 +26,58 @@ import h5py
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from datasets.patchify import patchify_tracks_batched
+
+
+class ShardGroupedSampler(Sampler[int]):
+    """Epoch order: shuffle shards, then shuffle rows within each shard.
+
+    Keeps consecutive ``__getitem__`` calls on one HDF5 file so a 1–2 slot
+    full-shard cache stays hot.  Publishes the shard visit plan so the dataset
+    can prefetch the next file while the GPU trains on the current one.
+    """
+
+    def __init__(
+        self,
+        file_paths: list[str],
+        *,
+        seed: int = 0,
+        dataset: "WaveformPatchDataset | None" = None,
+    ) -> None:
+        by_shard: dict[str, list[int]] = defaultdict(list)
+        for i, fp in enumerate(file_paths):
+            by_shard[fp].append(i)
+        self._groups = [
+            (fp, np.asarray(ix, dtype=np.int64)) for fp, ix in by_shard.items()
+        ]
+        self.seed = int(seed)
+        self.epoch = 0
+        self._n = sum(len(g) for _, g in self._groups)
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return self._n
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self.epoch += 1
+        order = rng.permutation(len(self._groups))
+        plan: list[str] = []
+        seq: list[int] = []
+        for gi in order:
+            fp, g0 = self._groups[int(gi)]
+            plan.append(fp)
+            g = g0.copy()
+            rng.shuffle(g)
+            seq.extend(int(i) for i in g)
+        if self.dataset is not None:
+            self.dataset.set_shard_plan(plan)
+        yield from seq
 
 
 def resolve_shard_path(path: str | Path, data_dir: str | Path) -> Path:
@@ -71,6 +121,9 @@ class WaveformPatchDataset(Dataset):
         self.patch_len = patch_len
         self.context_patches = context_patches
         self.preload = preload
+        # Decoded-shard LRU; 2 slots = current + background prefetch.
+        if not preload and max_cached_shards is None:
+            max_cached_shards = 2
         self.max_cached_shards = max_cached_shards
         self.share_memory = share_memory
 
@@ -92,9 +145,39 @@ class WaveformPatchDataset(Dataset):
 
         # Storage backend.
         self._log_a = self._phi = self._theta = self._ref_phase = None  # preload
-        self._shard_cache: "OrderedDict[str, dict]" = OrderedDict()      # fallback
+        self._shard_cache: "OrderedDict[str, dict]" = OrderedDict()
+        self._cache_lock = threading.Lock()
+        self._path_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._shard_plan: list[str] = []
+        self._prefetch_thread: threading.Thread | None = None
+        self._prefetch_fp: str | None = None
         if self.preload:
             self._preload_split()
+
+    # ------------------------------------------------------------------ #
+    # Pickle (Python 3.14 DataLoader uses forkserver → must pickle dataset)
+    # ------------------------------------------------------------------ #
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        # Locks / live threads are not picklable; workers rebuild empty caches.
+        state["_cache_lock"] = None
+        state["_path_locks"] = None
+        state["_prefetch_thread"] = None
+        state["_prefetch_fp"] = None
+        state["_shard_cache"] = OrderedDict()
+        state["_shard_plan"] = []
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._cache_lock = threading.Lock()
+        self._path_locks = defaultdict(threading.Lock)
+        self._prefetch_thread = None
+        self._prefetch_fp = None
+        if not isinstance(self._shard_cache, OrderedDict):
+            self._shard_cache = OrderedDict()
+        if self._shard_plan is None:
+            self._shard_plan = []
 
     # ------------------------------------------------------------------ #
     # Norm stats                                                          #
@@ -153,25 +236,103 @@ class WaveformPatchDataset(Dataset):
         self._log_a, self._phi, self._theta, self._ref_phase = log_a, phi, theta, ref_phase
 
     # ------------------------------------------------------------------ #
-    # Cached-shard fallback (bounded memory, opened lazily post-fork)     #
+    # Decoded-shard LRU + background prefetch                             #
     # ------------------------------------------------------------------ #
-    def _shard(self, fp: str) -> dict:
+    def set_shard_plan(self, plan: list[str]) -> None:
+        """Visit order for this epoch; prefetch shard 1 while shard 0 loads."""
+        self._join_prefetch()
+        self._shard_plan = list(plan)
+        # Overlap first two shard reads (different files → safe concurrency).
+        if len(plan) >= 2 and self.max_cached_shards and self.max_cached_shards >= 2:
+            self._start_prefetch(plan[1], keep_fp=plan[0])
+
+    def _join_prefetch(self) -> None:
+        t = self._prefetch_thread
+        if t is not None and t.is_alive():
+            t.join()
+        self._prefetch_thread = None
+        self._prefetch_fp = None
+
+    def _decode_shard_file(self, shard: Path) -> dict:
+        # Per-path lock: same file must not be read from two threads (h5py hang).
+        key = str(shard)
+        with self._path_locks[key]:
+            with h5py.File(shard, "r") as f:
+                return {
+                    "log_a": np.asarray(f["log_a"][:], dtype=np.float32),
+                    "phi": np.asarray(f["phi"][:], dtype=np.float32),
+                    "theta": np.asarray(f["theta"][:], dtype=np.float32),
+                    "ref_phase": np.asarray(f["ref_phase"][:], dtype=np.float32),
+                }
+
+    def _insert_shard(self, fp: str, entry: dict, *, keep_fp: str | None) -> None:
         cache = self._shard_cache
-        hit = cache.get(fp)
-        if hit is not None:
-            cache.move_to_end(fp)
-            return hit
-        shard = resolve_shard_path(fp, self.data_dir)
-        with h5py.File(shard, "r") as f:
-            entry = {
-                "log_a": f["log_a"][:],
-                "phi": f["phi"][:],
-                "theta": f["theta"][:],
-                "ref_phase": f["ref_phase"][:],
-            }
         cache[fp] = entry
-        if self.max_cached_shards and len(cache) > self.max_cached_shards:
-            cache.popitem(last=False)  # evict least-recently-used
+        cache.move_to_end(fp)
+        while self.max_cached_shards and len(cache) > self.max_cached_shards:
+            victim = next((k for k in cache if k != keep_fp and k != fp), None)
+            if victim is None:
+                break
+            del cache[victim]
+
+    def _next_in_plan(self, fp: str) -> str | None:
+        try:
+            i = self._shard_plan.index(fp)
+        except ValueError:
+            return None
+        if i + 1 < len(self._shard_plan):
+            return self._shard_plan[i + 1]
+        return None
+
+    def _start_prefetch(self, fp: str, *, keep_fp: str | None) -> None:
+        if not self.max_cached_shards or self.max_cached_shards < 2:
+            return
+        with self._cache_lock:
+            if fp in self._shard_cache:
+                return
+            if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+                return
+        shard = resolve_shard_path(fp, self.data_dir)
+
+        def work() -> None:
+            entry = self._decode_shard_file(shard)
+            with self._cache_lock:
+                self._insert_shard(fp, entry, keep_fp=keep_fp)
+
+        self._prefetch_fp = fp
+        self._prefetch_thread = threading.Thread(target=work, daemon=True)
+        self._prefetch_thread.start()
+
+    def _shard(self, fp: str) -> dict:
+        with self._cache_lock:
+            hit = self._shard_cache.get(fp)
+            if hit is not None:
+                self._shard_cache.move_to_end(fp)
+        if hit is not None:
+            nxt = self._next_in_plan(fp)
+            if nxt is not None:
+                self._start_prefetch(nxt, keep_fp=fp)
+            return hit
+
+        # Finish background load if it's for this shard (or any — I/O is serial).
+        if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+            self._join_prefetch()
+            with self._cache_lock:
+                hit = self._shard_cache.get(fp)
+                if hit is not None:
+                    self._shard_cache.move_to_end(fp)
+            if hit is not None:
+                nxt = self._next_in_plan(fp)
+                if nxt is not None:
+                    self._start_prefetch(nxt, keep_fp=fp)
+                return hit
+
+        entry = self._decode_shard_file(resolve_shard_path(fp, self.data_dir))
+        with self._cache_lock:
+            self._insert_shard(fp, entry, keep_fp=fp)
+        nxt = self._next_in_plan(fp)
+        if nxt is not None:
+            self._start_prefetch(nxt, keep_fp=fp)
         return entry
 
     # ------------------------------------------------------------------ #
@@ -189,12 +350,12 @@ class WaveformPatchDataset(Dataset):
                 float(self._ref_phase[idx]),
             )
         fp = self._file_path[idx]
-        ri = self._row_index[idx]
+        ri = int(self._row_index[idx])
         e = self._shard(fp)
         return (
-            torch.from_numpy(e["log_a"][ri].astype(np.float32, copy=False)),
-            torch.from_numpy(e["phi"][ri].astype(np.float32, copy=False)),
-            torch.from_numpy(e["theta"][ri].astype(np.float32, copy=False)),
+            torch.from_numpy(e["log_a"][ri]),
+            torch.from_numpy(e["phi"][ri]),
+            torch.from_numpy(e["theta"][ri]),
             float(e["ref_phase"][ri]),
         )
 
@@ -227,14 +388,20 @@ def compute_norm_stats(
 ) -> Path:
     """Compute training-set normalization statistics (patch-level log_a and Δφ).
 
-    Reads the train split once into RAM, then patchifies (vectorized) to derive
-    per-channel mean/std of the patch-mean log_a and the linear Δφ increment.
+    Streams train rows (no full-split preload) so 1M-scale pools fit in RAM.
     Subsamples up to ``max_samples`` train rows; pass ``max_samples=0`` for all.
     """
     import logging
 
     log = logging.getLogger(__name__)
-    ds = WaveformPatchDataset(manifest_path, split="train", patch_len=patch_len, preload=True)
+    # preload=False: never materialise the full train split in RAM.
+    ds = WaveformPatchDataset(
+        manifest_path,
+        split="train",
+        patch_len=patch_len,
+        preload=False,
+        max_cached_shards=2,
+    )
     n = len(ds)
     if max_samples > 0 and n > max_samples:
         rng = np.random.default_rng(seed)
@@ -242,30 +409,47 @@ def compute_norm_stats(
         log.info("Computing norm_stats from %d / %d train samples", len(indices), n)
     else:
         indices = np.arange(n)
-        log.info("Computing norm_stats from all %d train samples", n)
+        log.info("Computing norm_stats from all %d train samples (streaming)", n)
 
-    idx = torch.from_numpy(np.asarray(indices, dtype=np.int64))
-    log_a = ds._log_a[idx]   # (M, C, T)
-    phi = ds._phi[idx]
+    # Group selected rows by shard; decompress one shard at a time (LZF-safe).
+    by_shard: dict[str, list[int]] = defaultdict(list)
+    for src_i in indices.tolist():
+        by_shard[ds._file_path[src_i]].append(int(ds._row_index[src_i]))
 
-    # Streaming per-channel accumulation, chunked to bound peak memory.
     c = ds.n_channels
     count = 0
     la_sum = torch.zeros(c, dtype=torch.float64)
     la_sq = torch.zeros(c, dtype=torch.float64)
     dp_sum = torch.zeros(c, dtype=torch.float64)
     dp_sq = torch.zeros(c, dtype=torch.float64)
-
     chunk = 256
-    for s in range(0, log_a.shape[0], chunk):
-        p = patchify_tracks_batched(log_a[s : s + chunk], phi[s : s + chunk], patch_len)
-        la = p["log_a"].reshape(-1, c).double()        # (M*n, C)
-        dp = p["delta_phi"].reshape(-1, c).double()
-        count += la.shape[0]
-        la_sum += la.sum(0)
-        la_sq += (la * la).sum(0)
-        dp_sum += dp.sum(0)
-        dp_sq += (dp * dp).sum(0)
+    data_dir = ds.data_dir
+
+    for fp, row_indices in by_shard.items():
+        shard = resolve_shard_path(fp, data_dir)
+        src = np.sort(np.asarray(row_indices, dtype=np.int64))
+        with h5py.File(shard, "r") as f:
+            n_rows = int(f["log_a"].shape[0])
+            # Sparse subsample: fancy-index selected rows only.
+            # Dense / full-shard: one [:] decompress (LZF-safe), then select.
+            if src.size < max(64, n_rows // 8):
+                log_a_np = np.asarray(f["log_a"][src], dtype=np.float32)
+                phi_np = np.asarray(f["phi"][src], dtype=np.float32)
+            else:
+                log_a_np = np.asarray(f["log_a"][:], dtype=np.float32)[src]
+                phi_np = np.asarray(f["phi"][:], dtype=np.float32)[src]
+        log_a = torch.from_numpy(log_a_np)
+        phi = torch.from_numpy(phi_np)
+        for s in range(0, log_a.shape[0], chunk):
+            p = patchify_tracks_batched(log_a[s : s + chunk], phi[s : s + chunk], patch_len)
+            la = p["log_a"].reshape(-1, c).double()
+            dp = p["delta_phi"].reshape(-1, c).double()
+            count += la.shape[0]
+            la_sum += la.sum(0)
+            la_sq += (la * la).sum(0)
+            dp_sum += dp.sum(0)
+            dp_sq += (dp * dp).sum(0)
+        del log_a, phi, log_a_np, phi_np
 
     la_mean = la_sum / count
     la_std = (la_sq / count - la_mean * la_mean).clamp_min(0).sqrt().clamp_min(1e-8)

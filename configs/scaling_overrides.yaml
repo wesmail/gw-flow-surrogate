@@ -1,0 +1,37 @@
+# Data-scaling study: loaded AFTER the flagship config, so model, optimiser,
+# loss weights, LR schedule and batch size are IDENTICAL to the flagship:
+#
+#   python main.py fit --config configs/n1000k_2p5m_final.yaml \
+#                      --config configs/scaling_overrides.yaml \
+#                      --data.manifest_path data/n1000k/manifest_train_<N>.parquet ...
+#
+# Only three things change:
+#   1. validation + checkpoints every 7813 steps (= one 1M epoch) for EVERY N,
+#      instead of every epoch (a 16k epoch is only 125 steps).
+#      320333 = 41 x 7813, so the last save is exactly the end of the schedule.
+#   2. frozen normalisation: never compute stats from the subset.
+#   3. logs go to logs/scaling/N<N>/seed<S>/ (name/version set by the job script).
+trainer:
+  max_steps: 320333
+  max_epochs: -1
+  check_val_every_n_epoch: null
+  val_check_interval: 7813
+  callbacks:                       # replaces the flagship list
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        every_n_train_steps: 7813
+        save_top_k: -1             # keep every 7813-step checkpoint (~40 MB each)
+        save_last: true            # last.ckpt = resume point
+        filename: "{step:06d}"     # -> step=320333.ckpt at the end
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: logs/scaling
+      name: PLACEHOLDER            # set by cluster/train_scaling.sbatch
+      version: PLACEHOLDER
+
+data:
+  compute_stats_if_missing: false

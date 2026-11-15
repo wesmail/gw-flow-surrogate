@@ -6,450 +6,208 @@ Ground truth comes from **NRHybSur3dq8** via `gwsurrogate` (geometric units, $G=
 
 ---
 
-## Quick map (read this first)
+## Quick map
 
-Steps **depend on each other**:
-| Step | What | Needs from previous steps |
-|------|------|---------------------------|
-| **0** | Install packages | — |
-| **1** | Smoke test (optional) | Step 0 only (no data) |
-| **2** | Generate data | Step 0 + `gwsurrogate` / GSL |
-| **3** | Set `residual_scale` in config | Step 2 (`manifest.parquet`) |
-| **4** | Train | Steps 2–3 |
-| **5** | Monitor training | Step 4 running (or finished logs) |
-| **6** | Evaluate (paper CSV) | Step 4 checkpoint + Step 2 manifest |
-| **7** | Figures (optional) | Step 6 CSVs |
-| **8** | Scaling law + choose $N$ | ≥2 (ideally 3) converged runs at different train sizes, same eval protocol |
+| Step | What |
+|------|------|
+| **0** | Install packages (below) |
+| **A–E** | **Scaling-law figure** — [Exact steps after install](#exact-steps-after-install-scaling-law-figure) |
+| **F** | Optional: flagship 1M train without nested subsets |
 
-**Paper numbers** must use the frozen protocol (see Step 6). Do not mix with `evalute.py`’s default 1-patch context.
+Paper numbers use the frozen protocol in that section (θ-only, pchip, `n_steps=40`, `mean_of=4`). Do not use ad-hoc `evalute.py` defaults.
+
+Older README: [`archive/README_old_scaling.md`](archive/README_old_scaling.md).
 
 ---
 
 ## 0. Required packages and install
 
-### What you need
-
 | Package | Role |
 |---------|------|
-| `torch` | Training / inference |
-| `lightning` | Trainer, CLI, logging |
-| `jsonargparse[signatures]` | LightningCLI configs |
-| `tensorboard` | Default training monitor |
-| `numpy`, `scipy` | Numerics / mismatch helpers |
-| `h5py`, `pyarrow`, `pandas` | Waveform storage + manifests |
-| `matplotlib` | Figures / diagnostic plots |
-| `tqdm` | Progress bars |
+| `torch`, `lightning`, `jsonargparse[signatures]` | Training / CLI |
+| `tensorboard` / optional `wandb` | Logging |
+| `numpy`, `scipy`, `h5py`, `pyarrow`, `pandas`, `matplotlib`, `tqdm` | Data + eval |
 | `gwsurrogate` | **Data generation only** (NRHybSur3dq8) |
-| `pytest` | Tests (optional; not in `requirements.txt`) |
-| `wandb` | Optional monitor (not required) |
-
-Recommended: **Python ≥ 3.10**, a CUDA-capable GPU for training/eval. Data generation is mostly CPU.
-
-### Install
+| `pytest` | Tests (optional) |
 
 ```bash
 cd gw-flow-surrogate
-
-# recommended: fresh environment
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+# gwsurrogate often needs GSL — e.g. conda install -c conda-forge gsl
+# or an IGWN env (igwn-py311) for generation
 ```
 
-`gwsurrogate` often needs system GSL / LAL. If you see `libgsl.so.27: cannot open shared object file`:
+You can train/eval on an already generated pool without `gwsurrogate`.
 
-```bash
-conda install -c conda-forge gsl
-# or use an IGWN env, e.g. igwn-py311, then pip install the rest
-```
-
-You can train/eval on **already generated** data without a working `gwsurrogate` install; you only need it for Step 2.
+Optional: `python smoke_test.py` and `pip install pytest && pytest tests/ -v`.
 
 ---
 
-## 1. Smoke test (optional, no data)
+## Exact steps after install (scaling-law figure)
 
-**Needs:** Step 0 only.
+Do these in order. Goal: six nested sizes × seeds → CSVs → one figure.
+
+**What you are reproducing.** One 1M training pool (Sobol, seed 42). Nested $N \in \{16\mathrm{k},\,40\mathrm{k},\,100\mathrm{k},\,251\mathrm{k},\,631\mathrm{k},\,1\mathrm{M}\}$ = first $N$ train points. Same val/test for every $N$. Same flagship YAML, fixed **320 333** steps. Headline: median **`mm_pt_full`**.
+
+### A. One-time machine setup
 
 ```bash
-python smoke_test.py
-# optional unit tests:
-pip install pytest
-pytest tests/ -v
+# 1. Edit cluster/env.sh: uncomment module load + activate your venv/conda
+#    with torch (+ gwsurrogate if you will generate). Set POOL if not data/n1000k.
+
+# 2. In every cluster/*.sbatch: uncomment #SBATCH --partition / --account
+
+# 3. Put the two small frozen reference files in place (shipped separately or
+#    copied from an existing pool). They must match the paper pool.
+mkdir -p data/ref
+cp /path/to/n1000k_manifest.parquet data/ref/n1000k_manifest.parquet
+cp /path/to/norm_stats.npz          data/ref/norm_stats.npz
+# If this machine already has the full pool:
+#   cp data/n1000k/manifest.parquet data/ref/n1000k_manifest.parquet
+#   cp data/n1000k/norm_stats.npz   data/ref/norm_stats.npz
 ```
 
-If this fails, fix the environment before generating data or training.
+### B. Download NRHybSur3dq8 and check the plan
+
+```bash
+python scripts/gen_shard.py download
+python scripts/gen_shard.py plan \
+  --infer-from data/ref/n1000k_manifest.parquet \
+  --reference  data/ref/n1000k_manifest.parquet
+# must print: PLAN MATCHES THE REFERENCE
+```
+
+### C. Generate the pool (~180 GB, 64 shards)
+
+**SLURM:**
+
+```bash
+mkdir -p logs/slurm
+sbatch --array=0-63 cluster/gen_pool.sbatch
+# wait until all 64 finish; re-submit is safe (done shards are skipped)
+bash cluster/finalize_pool.sh
+# must print: POOL MATCHES THE REFERENCE
+```
+
+**No SLURM** (same scripts):
+
+```bash
+mkdir -p logs/slurm
+for i in $(seq 0 63); do SLURM_ARRAY_TASK_ID=$i bash cluster/gen_pool.sbatch; done
+bash cluster/finalize_pool.sh
+```
+
+`finalize_pool.sh` merges manifests, copies **frozen** `norm_stats.npz` from `data/ref/`, and writes `manifest_train_<N>.parquet` for each size.
+
+**Skip C** if `data/n1000k/` already has `manifest.parquet`, `norm_stats.npz`, shards, and the nested `manifest_train_*.parquet` files. Then only ensure `data/ref/` matches (step A.3) and jump to D.
+
+### D. Train + eval (writes one CSV per run)
+
+Each job trains to `step=320333.ckpt`, then evals 1000 test rows → `results/scaling/N<N>_seed<S>.csv`.
+
+**SLURM — phase 1 (6 sizes, seed 0):**
+
+```bash
+bash cluster/submit_scaling.sh
+```
+
+**SLURM — phase 2 (more seeds):**
+
+```bash
+SEEDS="1 2" bash cluster/submit_scaling.sh
+```
+
+**No SLURM** (example: one size):
+
+```bash
+N=16000 SEED=0 bash cluster/train_scaling.sbatch
+# repeat for every N and seed you need
+```
+
+Cost: ~**15 GPU-h** per run on an RTX 4090. Phase 1 = 6 runs; three seeds × six $N$ = 18 runs.
+
+### E. Aggregate + plot
+
+```bash
+python scripts/make_scaling_summary.py \
+  --glob 'results/scaling/N*_seed*.csv' \
+  --out results/paper/scaling_summary.csv
+
+python paper_figs/fig_scaling_final.py \
+  --summary results/paper/scaling_summary.csv
+# writes paper_figs/out/fm_scaling_final.{pdf,png} (via style.save)
+```
+
+### What success looks like
+
+| Path | Meaning |
+|------|---------|
+| `logs/scaling/N<N>/seed<S>/checkpoints/step=320333.ckpt` | Final model (always this step; not best-val) |
+| `results/scaling/N<N>_seed<S>.csv` | Per-waveform mismatches; use column **`mm_pt_full`** |
+| `results/paper/scaling_summary.csv` | Per-seed + per-$N$ medians for the figure |
+| `paper_figs/out/fm_scaling_final.*` | Scaling-law figure |
+
+### Frozen choices (do not change)
+
+| Choice | Value |
+|--------|--------|
+| Norms | `data/ref/norm_stats.npz` → copied into the pool; **never** recomputed |
+| Val / ckpt interval | every **7813** steps (`configs/scaling_overrides.yaml`) |
+| Eval | θ-only (`--fractions 0`), `pchip`, `--n-steps 40`, `--mean-of 4`, `--seed 1234` |
+| Test rows | first **1000** of pool `test` |
+| Headline | median **`mm_pt_full`**; also % $<10^{-3}$ and same for $\chi_\mathrm{eff}>0.4$ |
+| Model YAML | `configs/n1000k_2p5m_final.yaml` |
+
+Pool layout: `--n-train 1000000 --val-fraction 0.1 --n-test 5000 --n-ood 500 --n-files 64 --seed 42` → **1 105 500** waveforms.
+
+### Troubleshooting
+
+| Symptom | What to do |
+|---------|------------|
+| Shard missing | Resubmit array; finished shards are skipped |
+| Job killed | Resubmit / chain; resumes from `last.ckpt` |
+| `finalize` won’t recompute norms | Intended — norms are frozen from `REF_NORM` |
+| Plan / compare fails | `GEN_ARGS` or seed changed mid-generation |
+| No CSVs for the plot | Wait until `train_scaling` prints `done: ... -> results/scaling/...csv` |
+
+Helpers: [`cluster/`](cluster/) (that folder’s README only points here).
 
 ---
 
-## 2. Generate data
+## Flagship training (full 1M pool)
 
-**Needs:** Step 0 with working `gwsurrogate` (+ GSL).
-
-**Produces:** `data/<run>/manifest.parquet`, `waveforms_*.h5`, norm stats under that directory.
-
-Example (25k train, a good first run):
+Same recipe as the scaling runs, without nested subsets:
 
 ```bash
-python -m data_generation.cli generate \
-    --output-dir data/25k \
-    --n-files 1 --n-train 25000 --n-test 500 --n-ood 500 \
-    --val-fraction 0.1 --dt 0.5 --seed 42
+python main.py fit --config configs/n1000k_2p5m_final.yaml \
+  --data.manifest_path ./data/n1000k/manifest.parquet \
+  --data.norm_stats_path ./data/n1000k/norm_stats.npz
 ```
 
-Larger producation-scale set (slow / large disk):
+(`configs/scale_2p5m.yaml` is the same recipe under the older filename.)
 
-```bash
-python -m data_generation.cli generate \
-    --output-dir data/120k \
-    --n-files 1 --n-train 120000 --n-test 1000 --n-ood 500 \
-    --val-fraction 0.1 --dt 0.5 --seed 42
-```
-
-| Split | Sampling | Purpose |
-|-------|----------|---------|
-| `train` | Scrambled Sobol | Training |
-| `val` | Disjoint Sobol (~10%) | Validation |
-| `test` | Uniform | In-domain eval |
-| `ood` | Extrapolation box | OOD probe |
-
-Tiny synthetic data (no `gwsurrogate`, for plumbing only):
-
-```bash
-python scripts/create_smoke_data.py
-```
-
-**Check:** `data/25k/manifest.parquet` exists before Step 3.
-
-Training later uses patch-level `norm_stats.npz` written by the DataModule, not generation’s `norm_stats.json`.
+Monitor with TensorBoard (`logs/`) or override to W&B via LightningCLI if desired.
 
 ---
 
-## 3. Set `residual_scale` (required before training)
+## Evaluate one checkpoint (manual)
 
-**Needs:** Step 2 manifest.
-
-**Produces:** a float you paste into the YAML configuration (`model.residual_scale`).
+Frozen protocol (matches the scaling jobs):
 
 ```bash
-python - <<'PY'
-from datasets.datamodule import WaveformDataModule
-from models.lightning_module import compute_residual_scale
+CKPT=logs/scaling/N1000000/seed0/checkpoints/step=320333.ckpt
+POOL=data/n1000k
 
-dm = WaveformDataModule(
-    manifest_path="data/25k/manifest.parquet",  # match your data
-    batch_size=64,
-    num_workers=0,
-)
-print(compute_residual_scale(dm, patch_len=32))
-PY
-```
-
-Edit the matching config, e.g. `configs/stage1.yaml`:
-
-- `model.residual_scale: <printed value>`
-- `data.manifest_path: ./data/25k/manifest.parquet` (or `data/120k/...`)
-
-Configs ship with a placeholder scale, **replace it** for the dataset you generated.
-
----
-
-## 4. Train
-
-**Needs:** Steps 2–3 (data on disk + config updated).
-
-```bash
-python main.py fit --config configs/stage1.yaml
-```
-
-Larger trunk:
-
-```bash
-python main.py fit --config configs/stage1_large.yaml
-```
-
-Overrides without editing YAML:
-
-```bash
-python main.py fit --config configs/stage1.yaml \
-    --data.manifest_path data/25k/manifest.parquet \
-    --data.batch_size 32 \
-    --trainer.max_epochs 50
-```
-
-| Config | Purpose |
-|--------|---------|
-| `configs/stage1.yaml` | Default small model (~2.5M) |
-| `configs/stage1_large.yaml` | Larger trunk |
-| `configs/stage1_smoke.yaml` | Tiny smoke train |
-| `configs/stage1_prob.yaml` | Legacy, unused by current `main.py` |
-
-**Produces:** checkpoints under `logs/<run_name>/version_*/checkpoints/`, e.g.  
-`epoch=XXX-val_mismatch=0.0YYY.ckpt`.
-
-Monitor **`val_mismatch`** (lower is better), not `val_loss`. Pick the checkpoint with the best (lowest) `val_mismatch` for Step 6.
-
----
-
-## 5. Monitor training
-
-**Needs:** Step 4 (logger writes while training; you can also open logs afterward).
-
-### Default: TensorBoard
-
-Configs already use `TensorBoardLogger` → `logs/`.
-
-In another terminal:
-
-```bash
-tensorboard --logdir logs
-# open the URL it prints (usually http://localhost:6006)
-```
-
-Watch `val_mismatch` and learning rate.
-
-### Optional: Weights & Biases
-
-```bash
-pip install wandb
-wandb login
-```
-
-Run with a W&B logger override (LightningCLI):
-
-```bash
-python main.py fit --config configs/stage1.yaml \
-  --trainer.logger.class_path=lightning.pytorch.loggers.WandbLogger \
-  --trainer.logger.init_args.project=gw-flow-surrogate \
-  --trainer.logger.init_args.name=stage1-25k
-```
-
-Use either TensorBoard **or** W&B; both are fine. The committed configs default to TensorBoard.
-
----
-
-## 6. Evaluate (step by step)
-
-**Needs:**
-
-1. A trained checkpoint from Step 4  
-2. The **same** (or compatible) `manifest.parquet` from Step 2  
-3. Frozen knobs below for any number you quote in a paper/talk  
-
-### Frozen evaluation protocol
-
-Also stored in `results/prefreeze/PROTOCOL.txt`:
-
-| Field | Value |
-|-------|--------|
-| split | `test` (first `--n-waveforms` rows) |
-| `--context-fraction` | `0.5` |
-| `--n-waveforms` | `500` |
-| `--n-samples` / `--mean-of` | `1` / `4` |
-| `--n-steps` | knee from speed frontier (typically `40`) |
-| headline metric | median of `mismatch_phase_time_future` |
-
-### 6a. Paper metrics CSV (use this for tables / scaling)
-
-```bash
-# set these to your paths
-CKPT=logs/<run>/version_*/checkpoints/<best-val_mismatch>.ckpt
-MANIFEST=data/25k/manifest.parquet   # or data/120k/manifest.parquet
-
-python eval_fm_unified.py \
+python paper_figs/fig_context_fraction.py eval \
   --checkpoint "$CKPT" \
-  --manifest "$MANIFEST" \
-  --split test \
-  --context-fraction 0.5 \
-  --n-waveforms 500 --n-samples 1 --mean-of 4 --n-steps 40 \
-  --out results/fm_eval.csv
+  --manifest "$POOL/manifest.parquet" --norm-stats "$POOL/norm_stats.npz" \
+  --split test --n-waveforms 1000 --fractions 0 \
+  --n-steps 40 --mean-of 4 --seed 1234 --amp-mode pchip \
+  --out results/scaling/manual_eval.csv
 ```
 
-**Produces:** `results/fm_eval.csv`. Report `mismatch_phase_time_future` median.
-
-### 6b. Diagnostics / plots (optional; different default context)
-
-Default = **1 context patch** (TODO: fix the protocol). Useful for overlays and drift plots.
-
-```bash
-python evalute.py \
-  --checkpoint "$CKPT" \
-  --manifest "$MANIFEST" \
-  --split test \
-  --n-waveforms 128 --n-samples 4 --n-steps 40 \
-  --mean-of 1 --n-plot 4 \
-  --output-dir eval_test
-```
-
-For paper-aligned overlays, I use `--context-fraction 0.5`.
-
-| Script | Default context | Use for |
-|--------|-----------------|---------|
-| `eval_fm_unified.py` | 50% seeded | Quoted mismatches |
-| `evalute.py` | 1 patch seeded | Plots / debugging |
-
-### 6c. Representation floor (optional)
-
-```bash
-python scripts/measure_floor.py \
-  --manifest "$MANIFEST" --split test --n-waveforms 200 \
-  --checkpoint "$CKPT" --n-steps 40 \
-  --out results/floor_metrics.json
-```
-
-### 6d. Gated full pipeline (optional)
-
-After we are happy with a checkpoint:
-
-```bash
-bash scripts/run_prefreeze_pipeline.sh help
-# edit CONFIG / env: CKPT, MANIFEST, N_STEPS, PYTHON
-bash scripts/run_prefreeze_pipeline.sh phase_a
-bash scripts/run_prefreeze_pipeline.sh phase_b
-N_STEPS=40 bash scripts/run_prefreeze_pipeline.sh freeze_protocol
-# … see script help for phase_c–f
-```
-
-Defaults inside that script may still point at local paths from a previous machine, always set `CKPT` and `MANIFEST`.
-
----
-
-## 7. Figures (optional)
-
-**Needs:** Step 6 CSVs (and sometimes the manifest). Outputs go to `paper_figs/out/`.
-
-For the **data-scaling law** (mismatch vs training size), see **Step 8**, it needs multiple trained models, not one CSV.
-
-```bash
-python paper_figs/fig_calibration.py eval \
-  --checkpoint "$CKPT" --manifest "$MANIFEST" \
-  --split test --context-fraction 0.5 --n-waveforms 500 --S 8 \
-  --out results/calibration.csv
-python paper_figs/fig_calibration.py plot results/calibration.csv
-python paper_figs/fig_speed_frontier.py eval \
-  --checkpoint "$CKPT" --manifest "$MANIFEST" \
-  --context-fraction 0.5 --steps 5 10 20 40 100 --n-waveforms 200 \
-  --out results/speed_frontier.csv
-python paper_figs/fig_speed_frontier.py plot results/speed_frontier.csv
-```
-
----
-
-## 8. Scaling law and estimating training data size
-
-**Preferred path (automated):** the full nested-pool study (300k generate → freeze norms →
-eight trainings → power-law gate → decision figure) lives in
-[`scripts/scale_study/README.md`](scripts/scale_study/README.md).
-Use that for the \(10^{-4}\) target study. The manual notes below remain as a short reference.
-
-**Needs:** Steps 2–6 repeated at **several** training-set sizes (same model size, same frozen eval protocol). Typical points: **6k → 25k → 120k** train waveforms.
-
-Goal: measure how median mismatch scales with $N$, then use that law to decide how much data you need for a target accuracy (e.g. $10^{-3}$).
-
-### 8a. Produce the scaling-law figure
-
-1. **Generate** datasets at each size (Step 2), e.g. `--n-train 6000`, `25000`, `120000`.
-2. For each size: set `residual_scale` (Step 3) → **train to convergence** (Step 4) →
-   keep the best `val_mismatch` checkpoint.
-3. **Evaluate each checkpoint** with the **same** frozen protocol (Step 6a), ideally on the
-   **same** test waveforms (same manifest / first 500 test rows):
-
-```bash
-# example: three CSVs, same MANIFEST and knobs
-for label in 6k 25k 120k; do
-  python eval_fm_unified.py \
-    --checkpoint "logs/flow_${label}/.../<best>.ckpt" \
-    --manifest data/120k/manifest.parquet \
-    --split test --context-fraction 0.5 \
-    --n-waveforms 500 --n-samples 1 --mean-of 4 --n-steps 40 \
-    --out "results/scale_${label}.csv"
-done
-```
-
-4. Read the headline median from each CSV:
-
-```bash
-python - <<'PY'
-import pandas as pd
-for f in ["results/scale_6k.csv", "results/scale_25k.csv", "results/scale_120k.csv"]:
-    m = pd.read_csv(f)["mismatch_phase_time_future"].median()
-    print(f"{f}: p50 = {m:.4e}")
-PY
-```
-
-5. Paste those p50s into `paper_figs/fig_scaling_final.py` (`CONVERGED_X` / `CONVERGED_Y`),
-   then plot:
-
-```bash
-# edit CONVERGED_Y = [p50_6k, p50_25k, p50_120k] in paper_figs/fig_scaling_final.py
-python paper_figs/fig_scaling_final.py
-```
-
-Optional per-$q$ slopes (same CSVs):
-
-```bash
-python paper_figs/fig_scaling_by_q.py \
-  --points 6000:results/scale_6k.csv \
-           25000:results/scale_25k.csv \
-           120000:results/scale_120k.csv \
-  --out-csv results/scaling_by_q.csv
-```
-
-**Rules that keep the law honest**
-
-- Same model capacity (e.g. small ~2.5M) across $N$.
-- Same eval protocol (ctx 0.5, 500 wf, mean-of 4, same `n-steps`).
-- Prefer the **same test set** for all points (otherwise sizes are not comparable).
-- Use **converged** best checkpoints only; fixed-budget / unfinished runs are not fit points.
-
-### 8b. Estimate how much training data you need
-
-Assume a power law $\mathrm{mismatch}_{p50} \approx A\, N^{b}$ (log–log line).
-With two measured points $(N_1, m_1)$, $(N_2, m_2)$:
-
-$$
-b = \frac{\log m_2 - \log m_1}{\log N_2 - \log N_1},
-\qquad
-A = m_1 / N_1^{b}.
-$$
-
-For a **target** mismatch $m_\star$ (e.g. $10^{-3}$):
-
-$$
-N_\star = \bigl(m_\star / A\bigr)^{1/b}
-= N_1 \,(m_\star / m_1)^{1/b}.
-$$
-
-Example (fit on 6k→25k, then ask for $m_\star = 10^{-3}$):
-
-```bash
-python - <<'PY'
-import math
-N1, m1 = 6000, 1.1e-2
-N2, m2 = 25000, 2.2e-3
-m_star = 1e-3
-
-b = (math.log(m2) - math.log(m1)) / (math.log(N2) - math.log(N1))
-N_star = N1 * (m_star / m1) ** (1.0 / b)
-print(f"slope b = {b:.3f}")
-print(f"N needed for p50 ≈ {m_star:.0e}: ~ {N_star:.0f} train waveforms")
-# check prediction at 120k:
-N3 = 120000
-m3_pred = m1 * (N3 / N1) ** b
-print(f"predicted p50 at N={N3}: {m3_pred:.3e}  (compare to measured later)")
-PY
-```
-
-**How to use this in practice**
-
-1. Train/eval at two sizes (e.g. 6k and 25k) under the frozen protocol.  
-2. Fit $b$, pick $m_\star$ (production target in the figure is $10^{-3}$).  
-3. Compute $N_\star$ that is the estimated training-set size.  
-4. Generate ≈ that many waveforms, train, and **measure** the new p50 (the law can bend;
-   the 120k point in this project landed within ~2× of the 6k–25k extrapolation).
-
-The dashed line in `fig_scaling_final.py` is that target $10^{-3}$, not a measured median.
+Headline: median of `mm_pt_full`. Also report fraction $<10^{-3}$ and the same for $\chi_\mathrm{eff}>0.4$.
 
 ---
 
@@ -457,20 +215,20 @@ The dashed line in `fig_scaling_final.py` is that target $10^{-3}$, not a measur
 
 ```
 gw-flow-surrogate/
-├── main.py                  # LightningCLI entry
+├── main.py
 ├── smoke_test.py
-├── eval_fm_unified.py       # paper CSV eval
-├── evalute.py               # diagnostics + plots
+├── eval_fm_unified.py / evalute.py
 ├── configs/
-├── data_generation/
-├── datasets/
-├── models/
-├── scripts/
-├── paper_figs/
-├── tests/
-├── results/prefreeze/PROTOCOL.txt
-├── data/                    # gitignored — from Step 2
-└── logs/                    # gitignored — from Step 4
+│   ├── n1000k_2p5m_final.yaml   # flagship recipe
+│   └── scaling_overrides.yaml   # fixed-step val/ckpt for scaling
+├── cluster/                     # SLURM + env for the scaling study
+├── scripts/gen_shard.py
+├── scripts/make_subset_manifests.py
+├── scripts/make_scaling_summary.py
+├── data_generation/  datasets/  models/  paper_figs/  tests/
+├── archive/                     # old docs / scale_study / prefreeze helpers
+├── data/                        # gitignored — pool + shards
+└── logs/                        # gitignored — training
 ```
 
 ---

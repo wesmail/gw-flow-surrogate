@@ -14,7 +14,11 @@ import torch
 from lightning.pytorch import LightningDataModule
 from torch.utils.data import DataLoader
 
-from datasets.waveform_dataset import WaveformPatchDataset, compute_norm_stats
+from datasets.waveform_dataset import (
+    ShardGroupedSampler,
+    WaveformPatchDataset,
+    compute_norm_stats,
+)
 
 
 _NORM_KEYS = ("norm_log_a_mean", "norm_log_a_std", "norm_dphi_mean", "norm_dphi_std")
@@ -57,16 +61,29 @@ class WaveformDataModule(LightningDataModule):
         super().__init__()
         self.save_hyperparameters()
 
-    def _make_dataloader(self, dataset: WaveformPatchDataset, *, shuffle: bool) -> DataLoader:
+    def _make_dataloader(
+        self,
+        dataset: WaveformPatchDataset,
+        *,
+        shuffle: bool,
+        group_by_shard: bool = False,
+    ) -> DataLoader:
         nw = int(self.hparams.num_workers)
         kwargs: dict = dict(
             dataset=dataset,
             batch_size=self.hparams.batch_size,
-            shuffle=shuffle,
             num_workers=nw,
             collate_fn=_collate_batch,
             pin_memory=torch.cuda.is_available(),
         )
+        if group_by_shard and not dataset.preload:
+            # Finish one HDF5 shard before the next; sampler publishes plan for prefetch.
+            kwargs["sampler"] = ShardGroupedSampler(
+                dataset._file_path, seed=0, dataset=dataset
+            )
+            kwargs["shuffle"] = False
+        else:
+            kwargs["shuffle"] = shuffle
         if nw > 0:
             kwargs["persistent_workers"] = bool(self.hparams.persistent_workers)
             kwargs["prefetch_factor"] = int(self.hparams.prefetch_factor)
@@ -101,10 +118,10 @@ class WaveformDataModule(LightningDataModule):
             self.test_ds = WaveformPatchDataset(split="test", **kwargs)
 
     def train_dataloader(self) -> DataLoader:
-        return self._make_dataloader(self.train_ds, shuffle=True)
+        return self._make_dataloader(self.train_ds, shuffle=True, group_by_shard=True)
 
     def val_dataloader(self) -> DataLoader:
-        return self._make_dataloader(self.val_ds, shuffle=False)
+        return self._make_dataloader(self.val_ds, shuffle=False, group_by_shard=True)
 
     def test_dataloader(self) -> DataLoader:
-        return self._make_dataloader(self.test_ds, shuffle=False)
+        return self._make_dataloader(self.test_ds, shuffle=False, group_by_shard=True)

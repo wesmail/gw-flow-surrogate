@@ -65,7 +65,9 @@ def run_eval(a: argparse.Namespace) -> None:
     spec.loader.exec_module(fm_eval)
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    lit = GWFlowSurrogateLit.load_from_checkpoint(a.checkpoint, map_location=dev).eval().to(dev)
+    lit = GWFlowSurrogateLit.load_from_checkpoint(a.checkpoint, map_location=dev)
+    lit.hparams.amp_mode = getattr(a, "amp_mode", "constant")
+    lit.eval().to(dev)
     stats = Path(a.manifest).parent / "norm_stats.npz"
     probe = WaveformPatchDataset(a.manifest, split=a.split, context_patches=1,
                                  norm_stats_path=stats, preload=False)
@@ -146,20 +148,49 @@ def run_plot(a: argparse.Namespace) -> None:
 
 
 if __name__ == "__main__":
+    use_proto = "--protocol" in sys.argv
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     e = sub.add_parser("eval")
     e.add_argument("--checkpoint", required=True)
-    e.add_argument("--manifest", required=True)
-    e.add_argument("--split", default="test")
-    e.add_argument("--context-fraction", type=float, default=0.5)
-    e.add_argument("--n-waveforms", type=int, default=500)
+    e.add_argument("--manifest", default=None, required=not use_proto)
+    e.add_argument("--split", default=None if use_proto else "test")
+    e.add_argument("--context-fraction", type=float,
+                    default=None if use_proto else 0.5)
+    e.add_argument("--n-waveforms", type=int,
+                    default=None if use_proto else 500)
     e.add_argument("--S", type=int, default=8)
-    e.add_argument("--n-steps", type=int, default=20)
-    e.add_argument("--batch-size", type=int, default=16)
+    e.add_argument("--n-steps", type=int, default=None if use_proto else 20)
+    e.add_argument("--batch-size", type=int, default=None if use_proto else 16)
+    e.add_argument("--amp-mode", default=None, choices=("constant", "linear", "pchip"))
+    e.add_argument("--seed", type=int, default=None if use_proto else 1234)
+    e.add_argument("--protocol", default=None)
+    e.add_argument("--override", action="store_true")
     e.add_argument("--out", default="results/calibration.csv")
     p = sub.add_parser("plot")
     p.add_argument("csv")
     p.add_argument("--talk", action="store_true")
     args = ap.parse_args()
+    if args.cmd == "eval" and args.protocol:
+        from protocol_utils import enforce_protocol, load_protocol
+        proto = load_protocol(args.protocol)
+        enforce_protocol(args, proto, override=args.override)
+        if args.manifest is None:
+            args.manifest = proto["test_manifest"]
+        if args.split is None:
+            args.split = proto["split"]
+        if args.n_waveforms is None:
+            args.n_waveforms = int(proto["n_waveforms_flagship"])
+        if args.n_steps is None:
+            args.n_steps = int(proto["n_steps"])
+        if args.batch_size is None:
+            args.batch_size = int(proto["batch_size"])
+        if args.context_fraction is None:
+            args.context_fraction = float(proto["context_fraction"])
+        if args.amp_mode is None:
+            args.amp_mode = proto["amp_mode"]
+        if args.seed is None:
+            args.seed = int(proto["seed"])
+    elif args.cmd == "eval" and args.amp_mode is None:
+        args.amp_mode = "constant"
     (run_eval if args.cmd == "eval" else run_plot)(args)

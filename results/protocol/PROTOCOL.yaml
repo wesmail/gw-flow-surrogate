@@ -1,0 +1,45 @@
+# Frozen paper evaluation protocol (code-enforced).
+# n_steps is PROVISIONAL until the speed-frontier knee is chosen.
+
+# Test waveforms (same geometric grid as training).
+test_manifest: data/n1000k/manifest.parquet
+split: test
+n_waveforms_flagship: 5000   # rows [0, 5000)
+n_waveforms_scaling: 1000    # rows [0, 1000) — prefix of the same test split
+
+# Generation / inference knobs
+context_fraction: 0.0        # theta-only → 1 seed patch
+amp_mode: pchip
+mean_of: 4
+n_samples: 1
+temperature: 1.0
+n_steps: 40                  # PROVISIONAL (speed frontier)
+seed: 1234
+batch_size: 64
+
+# Metrics
+headline_metric: mm_pt_full   # median; phase+time-opt vs ORIGINAL waveform, full length
+window_start_fraction: 0.75  # last 25% (merger window)
+target_mismatch: [1.0e-3, 1.0e-4]
+report_percentiles: [50, 90, 99]
+report_columns:
+  - mm_pt_full
+  - mm_strict_full
+  - mm_pt_window
+  - floor_pt_full
+  - floor_pt_window
+  - dphi_peak_rad
+  - dt_shift_M
+
+inference_dtype: "fp32 network, fp64 reconstruction and mismatch"
+
+# Audited training grid (must match every eval manifest)
+grid:
+  t_min: -5000.0
+  t_max: 130.0
+  dt: 0.5
+  n_time: 10261
+  patch_len: 32
+  n_patches: 320
+
+checkpoint_selection: lowest val_mismatch in filename (exclude last.ckpt)

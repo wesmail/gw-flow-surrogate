@@ -9,6 +9,7 @@ scaling/
 
 # Local env / caches
 .venv/
+.vscode/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -22,12 +23,18 @@ paper_figs/out/
 results/*.csv
 !results/prefreeze/
 results/scale_study/
+results/scaling/
+results/protocol/*.log
+results/context_fraction_flagship.json
 
 # Scale-study local protocol (keep the .example committed)
 scripts/scale_study/PROTOCOL.env
+archive/scripts/scale_study/PROTOCOL.env
 
 # Archives / personal
 *.zip
+*.tar.gz
+scan_1M/
 resources/
 talk/
 eucaif_poster/
