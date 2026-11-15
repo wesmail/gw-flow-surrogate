@@ -30,10 +30,10 @@ def test_protocol_loads_and_validates():
     p = load_protocol(PROTO)
     assert p["amp_mode"] == "pchip"
     assert float(p["context_fraction"]) == 0.0
-    assert int(p["mean_of"]) == 4
+    assert int(p["mean_of"]) == 1
     assert int(p["n_samples"]) == 1
     assert float(p["temperature"]) == 1.0
-    assert int(p["n_steps"]) == 40
+    assert int(p["n_steps"]) == 12
     assert int(p["seed"]) == 1234
     assert int(p["batch_size"]) == 64
     assert p["test_manifest"] == "data/n1000k/manifest.parquet"
@@ -66,7 +66,7 @@ def test_protocol_rejects_missing_key(tmp_path):
 def test_conflicting_cli_flag_raises():
     proto = load_protocol(PROTO)
     args = SimpleNamespace(
-        mean_of=1,
+        mean_of=4,  # conflicts with frozen mean_of=1
         amp_mode=None,
         manifest=None,
         split=None,
@@ -84,7 +84,7 @@ def test_conflicting_cli_flag_raises():
 def test_override_records_conflict():
     proto = load_protocol(PROTO)
     args = SimpleNamespace(
-        mean_of=1,
+        mean_of=4,  # conflicts with frozen mean_of=1
         amp_mode=None,
         manifest=None,
         split=None,
@@ -97,7 +97,7 @@ def test_override_records_conflict():
     )
     ov = enforce_protocol(args, proto, override=True)
     assert "mean_of" in ov
-    assert args.mean_of == 1
+    assert args.mean_of == 4
 
 
 def test_norm_stats_guard_raises_without_hparams(tmp_path):

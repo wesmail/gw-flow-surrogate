@@ -1,5 +1,5 @@
 # Frozen paper evaluation protocol (code-enforced).
-# n_steps is PROVISIONAL until the speed-frontier knee is chosen.
+# Sampler: n_steps=12, mean_of=1 (frozen after speed-frontier study).
 
 # Test waveforms (same geometric grid as training).
 test_manifest: data/n1000k/manifest.parquet
@@ -10,10 +10,10 @@ n_waveforms_scaling: 1000    # rows [0, 1000) — prefix of the same test split
 # Generation / inference knobs
 context_fraction: 0.0        # theta-only → 1 seed patch
 amp_mode: pchip
-mean_of: 4
+mean_of: 1                   # single sample (4× cheaper; ~1 pp gain not worth it)
 n_samples: 1
 temperature: 1.0
-n_steps: 40                  # PROVISIONAL (speed frontier)
+n_steps: 12                  # frozen (speed-frontier knee)
 seed: 1234
 batch_size: 64
 

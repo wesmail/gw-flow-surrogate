@@ -54,7 +54,7 @@ if [[ ! -f "$CSV" ]]; then
   python paper_figs/fig_context_fraction.py eval --checkpoint "$FINAL" \
       --manifest "$POOL/manifest.parquet" --norm-stats "$POOL/norm_stats.npz" \
       --split test --n-waveforms "$EVAL_ROWS" --fractions 0 \
-      --n-steps 40 --mean-of 4 --seed 1234 --amp-mode pchip \
+      --n-steps 12 --mean-of 1 --seed 1234 --amp-mode pchip \
       --out "$CSV"
 fi
 echo "done: $FINAL  ->  $CSV   $(date)"

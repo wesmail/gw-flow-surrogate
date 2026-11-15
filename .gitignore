@@ -24,7 +24,11 @@ results/*.csv
 !results/prefreeze/
 results/scale_study/
 results/scaling/
+results/sampler/
+results/sampler_fine/
+results/sampler_low/
 results/protocol/*.log
+results/protocol/WORKLOG.md
 results/context_fraction_flagship.json
 
 # Scale-study local protocol (keep the .example committed)

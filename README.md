@@ -14,7 +14,7 @@ Ground truth comes from **NRHybSur3dq8** via `gwsurrogate` (geometric units, $G=
 | **A–E** | **Scaling-law figure** — [Exact steps after install](#exact-steps-after-install-scaling-law-figure) |
 | **F** | Optional: flagship 1M train without nested subsets |
 
-Paper numbers use the frozen protocol in that section (θ-only, pchip, `n_steps=40`, `mean_of=4`). Do not use ad-hoc `evalute.py` defaults.
+Paper numbers use the frozen protocol in that section (θ-only, pchip, `n_steps=12`, `mean_of=1`). Do not use ad-hoc `evalute.py` defaults.
 
 Older README: [`archive/README_old_scaling.md`](archive/README_old_scaling.md).
 
@@ -154,7 +154,7 @@ python paper_figs/fig_scaling_final.py \
 |--------|--------|
 | Norms | `data/ref/norm_stats.npz` → copied into the pool; **never** recomputed |
 | Val / ckpt interval | every **7813** steps (`configs/scaling_overrides.yaml`) |
-| Eval | θ-only (`--fractions 0`), `pchip`, `--n-steps 40`, `--mean-of 4`, `--seed 1234` |
+| Eval | θ-only (`--fractions 0`), `pchip`, `--n-steps 12`, `--mean-of 1`, `--seed 1234` |
 | Test rows | first **1000** of pool `test` |
 | Headline | median **`mm_pt_full`**; also % $<10^{-3}$ and same for $\chi_\mathrm{eff}>0.4$ |
 | Model YAML | `configs/n1000k_2p5m_final.yaml` |
@@ -203,7 +203,7 @@ python paper_figs/fig_context_fraction.py eval \
   --checkpoint "$CKPT" \
   --manifest "$POOL/manifest.parquet" --norm-stats "$POOL/norm_stats.npz" \
   --split test --n-waveforms 1000 --fractions 0 \
-  --n-steps 40 --mean-of 4 --seed 1234 --amp-mode pchip \
+  --n-steps 12 --mean-of 1 --seed 1234 --amp-mode pchip \
   --out results/scaling/manual_eval.csv
 ```
 

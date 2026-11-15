@@ -12,11 +12,11 @@ Usage::
         --norm-stats /path/to/train_norm_stats.npz \\
         --n-waveforms 1000 \\
         --context-fraction 0.5 \\
-        --n-steps 40 \\
+        --n-steps 12 \\
         --out results/paper/flagship.csv
 
-``--n-steps`` and ``--context-fraction`` may come from the protocol file once
-Phase 4a/4b fill them; until then they are required on the CLI (or in YAML).
+``--n-steps`` / ``--mean-of`` / ``--context-fraction`` default from the protocol
+file when ``--protocol`` is set.
 """
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ def main() -> None:
     manifest = Path(args.manifest or proto["test_manifest"])
     split = args.split or proto.get("split", "test")
     n_waveforms = int(args.n_waveforms or proto.get("n_waveforms_flagship") or 5000)
-    mean_of = int(args.mean_of if args.mean_of is not None else proto.get("mean_of", 4))
+    mean_of = int(args.mean_of if args.mean_of is not None else proto.get("mean_of", 1))
     temperature = float(args.temperature if args.temperature is not None else proto.get("temperature", 1.0))
     seed = int(args.seed if args.seed is not None else proto.get("seed", 1234))
     batch_size = int(args.batch_size if args.batch_size is not None else proto.get("batch_size", 64))

@@ -33,7 +33,7 @@ STAGE 1 (eval, GPU)::
         --norm-stats data/scale300k/norm_stats.npz \\
         --split test --n-waveforms 1000 \\
         --fractions 0 0.25 0.5 0.75 \\
-        --n-steps 40 --mean-of 4 --seed 1234 \\
+        --n-steps 12 --mean-of 1 --seed 1234 \\
         --out results/context_fraction.csv
 
     --norm-stats MUST be the file the checkpoint was trained with. If omitted,
@@ -390,7 +390,7 @@ if __name__ == "__main__":
                    help="start of common window as a fraction (default: max of --fractions)")
     e.add_argument("--n-steps", type=int, default=None if use_proto else None,
                    required=not use_proto, help="Euler steps (frozen protocol)")
-    e.add_argument("--mean-of", type=int, default=None if use_proto else 4)
+    e.add_argument("--mean-of", type=int, default=None if use_proto else 1)
     e.add_argument("--temperature", type=float, default=None if use_proto else 1.0)
     e.add_argument("--amp-mode", default=None if use_proto else "constant",
                    choices=("constant", "linear", "pchip"),

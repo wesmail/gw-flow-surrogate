@@ -26,7 +26,7 @@ Usage (repo root)::
         --checkpoint logs/scale_study/n1000k_2p5m/version_2/checkpoints/last.ckpt \\
         --manifest data/n1000k/manifest.parquet \\
         --norm-stats data/n1000k/norm_stats.npz \\
-        --n-waveforms 200 --n-steps 40 --mean-of 4 \\
+        --n-waveforms 200 --n-steps 12 --mean-of 1 \\
         --eval-csv results/anneal_last.csv \\
         --out results/dphi_bias_2p5m.csv
 
