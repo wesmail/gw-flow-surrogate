@@ -42,4 +42,4 @@ grid:
   patch_len: 32
   n_patches: 320
 
-checkpoint_selection: lowest val_mismatch in filename (exclude last.ckpt)
+checkpoint_selection: final checkpoint of the fixed 320333-step schedule (step=320333.ckpt; not early stopping)
