@@ -72,10 +72,14 @@ def _load_surrogate(name: str = "NRHybSur3dq8"):
     if _SURROGATE is None:
         import gwsurrogate
 
-        try:
-            gwsurrogate.catalog.pull(name)
-        except Exception as exc:
-            log.warning("catalog.pull failed (%s); trying LoadSurrogate.", exc)
+        # pull() always moves the existing file into backup/ and re-downloads.
+        # Only fetch when the .h5 is missing (parallel PE workers would otherwise race).
+        h5 = Path(gwsurrogate.catalog.download_path()) / f"{name}.h5"
+        if not h5.is_file():
+            try:
+                gwsurrogate.catalog.pull(name)
+            except Exception as exc:
+                log.warning("catalog.pull failed (%s); trying LoadSurrogate.", exc)
         _SURROGATE = gwsurrogate.LoadSurrogate(name)
         log.info("Loaded %s in pid %d", name, os.getpid())
     return _SURROGATE

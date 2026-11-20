@@ -167,10 +167,11 @@ def run_eval(a: argparse.Namespace) -> None:
             for fr, ctx in zip(a.fractions, ctxs):
                 # common random numbers: same noise stream for every fraction
                 torch.manual_seed(a.seed + bi)
-                gen = lit.model.generate(feat[:, :ctx], b["theta"], N - ctx,
-                                         n_steps=a.n_steps, n_samples=1,
-                                         temperature=a.temperature,
-                                         mean_of=a.mean_of)[:, 0]
+                gen_fn = lit.model.generate_fast if getattr(a, "fast", False) else lit.model.generate
+                gen = gen_fn(feat[:, :ctx], b["theta"], N - ctx,
+                             n_steps=a.n_steps, n_samples=1,
+                             temperature=a.temperature,
+                             mean_of=a.mean_of)[:, 0]
                 h_pred = reconstruct(torch.cat([feat[:, :ctx], gen], dim=1), b)
                 s_g = ctx * P
 
@@ -402,6 +403,8 @@ if __name__ == "__main__":
     e.add_argument("--out", default="results/context_fraction.csv")
     e.add_argument("--protocol", default=None)
     e.add_argument("--override", action="store_true")
+    e.add_argument("--fast", action="store_true",
+                   help="opt-in generate_fast (static KV + capture); default off")
     p = sub.add_parser("plot")
     p.add_argument("csv")
     p.add_argument("--target", type=float, default=1e-3)

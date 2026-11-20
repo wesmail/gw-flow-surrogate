@@ -2,31 +2,40 @@
 """UQ calibration: does the model's sample spread predict its actual error?
 
 The flow head is stochastic: S independent generations per waveform give an
-ensemble. If the ensemble's internal SPREAD correlates with the TRUE error
-(vs. ground truth), the surrogate provides usable uncertainty — the selling
-point no deterministic surrogate has. This script measures that.
+ensemble. Two numbers per waveform:
+  spread  = mean pairwise mismatch BETWEEN the S samples  (needs no truth)
+  error   = mean mismatch of the S samples AGAINST the truth
+If the spread ranks waveforms by their true error, the surrogate tells its user
+which waveforms to trust -- something a deterministic surrogate cannot do.
 
-STAGE 1 (eval, GPU, ~30-60 min for 500x8 samples)::
+Expected relation (small phase errors, mismatch ~ 0.5 <dphi^2>): with a shared
+bias b and a random part of variance s^2,  error ~ 0.5 (b^2 + s^2),
+spread ~ s^2,  so  error ~ spread/2 + b^2/2.  Points ABOVE the line
+error = spread/2 carry a shared (systematic) error the spread cannot see.
 
-    python paper_figs/fig_calibration.py eval \
-        --checkpoint <ckpt> --manifest data/120k/manifest.parquet \
-        --split test --context-fraction 0.5 --n-waveforms 500 --S 8 \
-        --out results/calibration.csv
+FROZEN PROTOCOL: theta-only, same engine and settings as the headline evaluation
+(read from its .json: n_steps, mean_of, seed, batch size, amp mode), the
+original waveform as truth, headline rows (idx >= 1000). Sample s = 0 uses the
+evaluation's own seed, so it IS the headline waveform (checked against the CSV).
 
-STAGE 2 (figure, CPU, seconds)::
+STAGE 1 (GPU, ~10 min for 1000 waveforms x 8 samples)::
 
-    python paper_figs/fig_calibration.py plot results/calibration.csv [--talk]
+    python paper_figs/fig_calibration.py eval --checkpoint "$FT" \
+        --manifest data/n1000k/manifest.parquet --norm-stats data/n1000k/norm_stats.npz \
+        --eval-csv results/headline_K12_M1.csv --S 8 --n-waveforms 1000 \
+        --out results/calibration_K12.csv
 
-Figure: (a) scatter of ensemble spread vs true error with rank correlation;
-(b) reliability curve: waveforms binned by spread decile, median true error
-per bin — monotone rising = calibrated ordering.
+STAGE 2 (CPU, seconds)::
 
-RUN FROM THE REPO ROOT (needs evalute.py + datasets/ + models/ importable).
+    python paper_figs/fig_calibration.py plot results/calibration_K12.csv
+
+Figure: (a) spread vs true error per waveform, with Spearman rank correlation;
+(b) reliability: waveforms in spread deciles, median and p90 true error per bin.
 """
 from __future__ import annotations
 
 import argparse
-import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -39,73 +48,107 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_PKG))
 from style import C, apply_style, save  # noqa: E402
 
-
-def mismatch_pt(h1: np.ndarray, h2: np.ndarray) -> float:
-    """Phase+time-optimized mismatch (unified convention)."""
-    h1 = np.asarray(h1, np.complex128).ravel()
-    h2 = np.asarray(h2, np.complex128).ravel()
-    n1, n2 = np.linalg.norm(h1), np.linalg.norm(h2)
-    if n1 == 0 or n2 == 0:
-        return 1.0
-    n_fft = 1 << int(np.ceil(np.log2(2 * h1.size)))
-    xc = np.fft.ifft(np.conj(np.fft.fft(h1, n_fft)) * np.fft.fft(h2, n_fft))
-    return 1.0 - float(np.abs(xc).max() / (n1 * n2))
+FIG_W = 11.0     # all full-width paper figures share this width (fonts then match)
 
 
 def run_eval(a: argparse.Namespace) -> None:
     import torch
     from torch.utils.data import DataLoader, Subset
-
+    from datasets.datamodule import _collate_batch
     from datasets.patchify import n_patches_for
     from datasets.waveform_dataset import WaveformPatchDataset
+    from models.amp_interp import log_amp_per_sample
     from models.lightning_module import GWFlowSurrogateLit
 
-    spec = importlib.util.spec_from_file_location("fm_eval", _ROOT / "evalute.py")
-    fm_eval = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(fm_eval)
+    csv = pd.read_csv(a.eval_csv)
+    if "context_fraction" in csv:
+        csv = csv[csv.context_fraction == csv.context_fraction.min()]
+    csv_mm = dict(zip(csv.idx.astype(int), csv.mm_pt_full))
+    meta_p = Path(a.eval_csv).with_suffix(".json")
+    meta = json.loads(meta_p.read_text()) if meta_p.is_file() else {}
+    n_steps = a.n_steps or int(meta.get("n_steps", 12))
+    mean_of = int(meta.get("mean_of", 1)); seed = int(meta.get("seed", 1234))
+    bs = int(meta.get("batch_size", 64)); temp = float(meta.get("temperature", 1.0))
+    amp_mode = a.amp_mode or meta.get("amp_mode", "pchip")
+    same_as_eval = n_steps == int(meta.get("n_steps", n_steps))
 
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    lit = GWFlowSurrogateLit.load_from_checkpoint(a.checkpoint, map_location=dev)
-    lit.hparams.amp_mode = getattr(a, "amp_mode", "constant")
-    lit.eval().to(dev)
-    stats = Path(a.manifest).parent / "norm_stats.npz"
-    probe = WaveformPatchDataset(a.manifest, split=a.split, context_patches=1,
-                                 norm_stats_path=stats, preload=False)
-    N = n_patches_for(probe.n_time, lit.hparams.patch_len)
-    ctx = max(1, int(round(N * a.context_fraction)))
-    ds = WaveformPatchDataset(a.manifest, split=a.split, context_patches=ctx,
-                              norm_stats_path=stats, preload=True)
-    n = min(a.n_waveforms, len(ds))
-    loader = DataLoader(Subset(ds, range(n)), batch_size=a.batch_size,
-                        collate_fn=fm_eval.collate)
+    dev = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    lit = GWFlowSurrogateLit.load_from_checkpoint(a.checkpoint, map_location=dev).eval().to(dev)
+    P, rscale = int(lit.hparams.patch_len), float(lit.hparams.residual_scale)
+    ds = WaveformPatchDataset(a.manifest, split=a.split, patch_len=P, context_patches=1,
+                              norm_stats_path=a.norm_stats, preload=False)
+    N = n_patches_for(ds.n_time, P); usable = N * P
+    n_eval = min(int(meta.get("n_waveforms", len(ds))), len(ds))
+    row0 = a.first_row; row1 = min(n_eval, row0 + a.n_waveforms)
+    print(f"rows {row0}..{row1 - 1}, S={a.S} samples each; theta-only; n_steps={n_steps} "
+          f"mean_of={mean_of} seed={seed} batch={bs} amp={amp_mode}")
 
-    rows: list[dict] = []
+    s_frac = torch.arange(P, device=dev, dtype=torch.float64) / P
+
+    def reconstruct(feat, b):
+        feat = feat.double()
+        la_m = b["norm_log_a_mean"][:, :1].double(); la_s = b["norm_log_a_std"][:, :1].double()
+        dp_m = b["norm_dphi_mean"][:, :1].double(); dp_s = b["norm_dphi_std"][:, :1].double()
+        la = log_amp_per_sample(feat[..., 0] * la_s + la_m, P, amp_mode)
+        dphi = feat[..., 1] * dp_s + dp_m
+        res = feat[..., 2:2 + P] * rscale
+        bnd = torch.cumsum(dphi, dim=1) - dphi
+        phase = (bnd[..., None] + s_frac * dphi[..., None] + res).reshape(feat.shape[0], -1)
+        return torch.exp(la) * torch.exp(-1j * phase)
+
+    nfft = 1 << int(np.ceil(np.log2(2 * usable)))
+
+    def mm_pt(F1, n1, F2, n2):
+        """phase+time-optimised mismatch from precomputed FFTs, row-wise."""
+        xc = torch.fft.ifft(F1.conj() * F2)
+        return 1 - xc.abs().amax(dim=1) / (n1 * n2)
+
+    rows = []
     with torch.no_grad():
-        for batch in loader:
-            # S independent single-sample generations (mean_of=1): the ensemble
-            preds, h_true, theta = [], None, None
-            for _ in range(a.S):
-                r = fm_eval.evaluate_batch(lit, batch, n_samples=1, n_steps=a.n_steps,
-                                           limit_patches=0, device=torch.device(dev),
-                                           mean_of=1)
-                preds.append(r["h_pred"].numpy())
-                h_true, theta = r["h_true"].numpy(), r["theta"]
-            preds = np.stack(preds)                      # (S, B, T)
-            for b in range(h_true.shape[0]):
-                mms = [mismatch_pt(h_true[b], preds[s, b]) for s in range(a.S)]
-                # ensemble spread: mean pairwise mismatch BETWEEN samples
-                # (ground-truth-free -> available at deployment time)
-                pair = [mismatch_pt(preds[i, b], preds[j, b])
-                        for i in range(a.S) for j in range(i + 1, a.S)]
-                q, c1, c2 = theta[b, :3].tolist()
-                rows.append(dict(
-                    idx=len(rows), q=q, chi1z=c1, chi2z=c2,
-                    err_mean=float(np.mean(mms)), err_std=float(np.std(mms)),
-                    spread=float(np.mean(pair)),
-                ))
-            print(f"  {len(rows)}/{n}")
+        for bi in range(row0 // bs, (row1 - 1) // bs + 1):
+            lo, hi = bi * bs, min((bi + 1) * bs, n_eval)
+            batch = next(iter(DataLoader(Subset(ds, range(lo, hi)), batch_size=bs,
+                                         collate_fn=_collate_batch, shuffle=False)))
+            b = lit._patchify_batch({k: v.to(dev) for k, v in batch.items()})
+            feat = b["token_features"]
+            la_o = b["log_a_track"][:, 0, :usable].double(); ph_o = b["phi_track"][:, 0, :usable].double()
+            ho = torch.exp(la_o) * torch.exp(-1j * (ph_o - ph_o[:, :1]))
+            Fo, no = torch.fft.fft(ho, nfft), torch.linalg.vector_norm(ho, dim=1)
+            Fs, ns, err = [], [], []
+            for s in range(a.S):
+                # s = 0: the evaluation's own seed -> exactly the headline waveform
+                torch.manual_seed(seed + bi + 100_000 * s)
+                gen = lit.model.generate(feat[:, :1], b["theta"], N - 1, n_steps=n_steps, n_samples=1,
+                                         temperature=temp, mean_of=mean_of)[:, 0]
+                hp = reconstruct(torch.cat([feat[:, :1], gen], dim=1), b)
+                F, n_ = torch.fft.fft(hp, nfft), torch.linalg.vector_norm(hp, dim=1)
+                Fs.append(F); ns.append(n_); err.append(mm_pt(Fo, no, F, n_))
+            err = torch.stack(err)                                   # (S, B)
+            pair = torch.stack([mm_pt(Fs[i], ns[i], Fs[j], ns[j])
+                                for i in range(a.S) for j in range(i + 1, a.S)])   # (S(S-1)/2, B)
+            err, pair = err.cpu().numpy(), pair.cpu().numpy()
+            th = b["theta"].double().cpu().numpy()
+            for j in range(hi - lo):
+                idx = lo + j
+                if idx < row0 or idx >= row1:
+                    continue
+                q, c1, c2 = th[j, :3]
+                rows.append(dict(idx=idx, q=q, chi1z=c1, chi2z=c2, chi_eff=(q * c1 + c2) / (1 + q),
+                                 err_deployed=err[0, j], err_mean=err[:, j].mean(),
+                                 err_std=err[:, j].std(), spread=pair[:, j].mean(),
+                                 err_csv=csv_mm.get(idx, np.nan)))
+            print(f"  {min(hi, row1) - row0}/{row1 - row0}")
+
+    d = pd.DataFrame(rows)
+    if same_as_eval and d.err_csv.notna().any():
+        rel = np.nanmax(np.abs(d.err_deployed / d.err_csv - 1))
+        print(f"check: sample 0 vs headline CSV, largest relative difference {rel:.1e} (should be ~0)")
     out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(rows).to_csv(out, index=False)
+    d.to_csv(out, index=False)
+    out.with_suffix(".json").write_text(json.dumps(dict(
+        checkpoint=str(a.checkpoint), eval_csv=str(a.eval_csv), rows=[row0, row1], S=a.S,
+        n_steps=n_steps, mean_of=mean_of, seed=seed, batch_size=bs, amp_mode=amp_mode,
+        seed_rule="sample s uses seed + batch + 100000*s; s=0 equals the headline evaluation"), indent=2))
     print("->", out)
 
 
@@ -117,80 +160,77 @@ def run_plot(a: argparse.Namespace) -> None:
 
     d = pd.read_csv(a.csv)
     rho = spearmanr(d.spread, d.err_mean).statistic
-    fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.2))
+    rho_dep = spearmanr(d.spread, d.err_deployed).statistic
+    fig, axes = plt.subplots(1, 2, figsize=(FIG_W, 4.2), constrained_layout=True)
 
     ax = axes[0]
-    ax.scatter(d.spread, d.err_mean, s=10, color=C["fm"], alpha=0.55)
-    lims = [min(d.spread.min(), d.err_mean.min()) * 0.7,
-            max(d.spread.max(), d.err_mean.max()) * 1.4]
-    ax.plot(lims, lims, ls=":", color=C["gray"], lw=1)
-    ax.set_xscale("log"); ax.set_yscale("log")
-    ax.set_xlabel("ensemble spread (sample-to-sample mismatch)")
-    ax.set_ylabel("true error (mismatch vs ground truth)")
-    ax.set_title(f"Spread predicts error  (Spearman ρ = {rho:.2f})")
+    hi = d.chi_eff > 0.4
+    ax.scatter(d.spread[~hi], d.err_mean[~hi], s=9, color=C["fm"], alpha=0.5, lw=0,
+               label=r"$\chi_\mathrm{eff}\leq0.4$")
+    ax.scatter(d.spread[hi], d.err_mean[hi], s=9, color=C["accent"], alpha=0.6, lw=0,
+               label=r"$\chi_\mathrm{eff}>0.4$")
+    lims = np.array([min(d.spread.min(), 2 * d.err_mean.min()) * 0.7,
+                     max(d.spread.max(), 2 * d.err_mean.max()) * 1.4])
+    ax.plot(lims, lims / 2, ls=":", color=C["gray"], lw=1.2, label="error = spread / 2\n(no shared error)")
+    ax.axhline(1e-3, color=C["accent"], ls="--", lw=0.9)
+    ax.set_xscale("log"); ax.set_yscale("log"); ax.set_xlim(lims)
+    ax.set_xlabel("spread (mismatch between samples)")
+    ax.set_ylabel("true error (mismatch vs NRHybSur3dq8)")
+    ax.set_title(f"(a) spread vs error   (Spearman $\\rho$ = {rho:.2f})")
+    ax.legend(loc="upper left", fontsize="x-small", frameon=False)
 
     ax = axes[1]
-    d = d.sort_values("spread").reset_index(drop=True)
-    edges = np.linspace(0, len(d), 11, dtype=int)
-    bins = [d.iloc[edges[i]:edges[i + 1]] for i in range(10)]
-    x = [b.spread.median() for b in bins]
-    y50 = [b.err_mean.median() for b in bins]
-    y90 = [b.err_mean.quantile(0.9) for b in bins]
-    ax.plot(x, y50, "o-", color=C["fm"], lw=2, label="median true error")
-    ax.fill_between(x, y50, y90, color=C["band"], alpha=0.7, label="to p90")
+    s = d.sort_values("spread").reset_index(drop=True)
+    edges = np.linspace(0, len(s), 11, dtype=int)
+    bins = [s.iloc[edges[i]:edges[i + 1]] for i in range(10)]
+    x = np.array([bb.spread.median() for bb in bins])
+    y50 = [bb.err_mean.median() for bb in bins]
+    y90 = [bb.err_mean.quantile(0.9) for bb in bins]
+    ax.fill_between(x, y50, y90, color=C["band"], alpha=0.8, lw=0, label="median to p90")
+    ax.plot(x, y50, "o-", color=C["fm"], lw=1.8, ms=4, label="median true error")
+    ax.plot(x, x / 2, ls=":", color=C["gray"], lw=1.2, label="error = spread / 2")
+    ax.axhline(1e-3, color=C["accent"], ls="--", lw=0.9, label="target $10^{-3}$")
     ax.set_xscale("log"); ax.set_yscale("log")
-    ax.set_xlabel("ensemble spread (decile bins)")
+    ax.set_xlabel("spread (10 bins of equal size)")
     ax.set_ylabel("true error")
-    ax.set_title("Reliability: binned by predicted uncertainty")
-    ax.legend()
+    ax.set_title("(b) reliability: error per spread bin")
+    ax.legend(loc="upper left", fontsize="x-small", frameon=False)
+    save(fig, a.out)
 
-    save(fig, "fm_calibration")
+    # ---- numbers for the text ---------------------------------------------
+    bad = d.err_deployed > 1e-3
+    print(f"\n{len(d)} waveforms")
+    print(f"Spearman rho(spread, mean error)     = {rho:.2f}")
+    print(f"Spearman rho(spread, deployed error) = {rho_dep:.2f}")
+    print(f"median spread {d.spread.median():.2e}; median mean error {d.err_mean.median():.2e}; "
+          f"ratio error/(spread/2) median {np.median(d.err_mean / (d.spread / 2)):.2f}")
+    print(f"share of waveforms above the line error = spread/2: {(d.err_mean > d.spread / 2).mean() * 100:.0f}%")
+    print(f"deployed waveforms above 1e-3: {bad.sum()} of {len(d)}")
+    for top in (0.05, 0.10, 0.20):
+        flag = d.spread >= d.spread.quantile(1 - top)
+        caught = (flag & bad).sum() / max(bad.sum(), 1)
+        print(f"  flag the {int(top * 100):2d}% largest spreads -> catches {caught * 100:.0f}% of the failures")
 
 
 if __name__ == "__main__":
-    use_proto = "--protocol" in sys.argv
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     e = sub.add_parser("eval")
     e.add_argument("--checkpoint", required=True)
-    e.add_argument("--manifest", default=None, required=not use_proto)
-    e.add_argument("--split", default=None if use_proto else "test")
-    e.add_argument("--context-fraction", type=float,
-                    default=None if use_proto else 0.5)
-    e.add_argument("--n-waveforms", type=int,
-                    default=None if use_proto else 500)
+    e.add_argument("--manifest", required=True)
+    e.add_argument("--norm-stats", required=True)
+    e.add_argument("--eval-csv", required=True, help="headline eval CSV (+ .json): settings and check")
+    e.add_argument("--split", default="test")
     e.add_argument("--S", type=int, default=8)
-    e.add_argument("--n-steps", type=int, default=None if use_proto else 20)
-    e.add_argument("--batch-size", type=int, default=None if use_proto else 16)
+    e.add_argument("--first-row", type=int, default=1000, help="headline rows start at 1000")
+    e.add_argument("--n-waveforms", type=int, default=1000)
+    e.add_argument("--n-steps", type=int, default=None, help="default: the headline setting")
     e.add_argument("--amp-mode", default=None, choices=("constant", "linear", "pchip"))
-    e.add_argument("--seed", type=int, default=None if use_proto else 1234)
-    e.add_argument("--protocol", default=None)
-    e.add_argument("--override", action="store_true")
-    e.add_argument("--out", default="results/calibration.csv")
+    e.add_argument("--device", default=None)
+    e.add_argument("--out", default="results/calibration_K12.csv")
     p = sub.add_parser("plot")
     p.add_argument("csv")
+    p.add_argument("--out", default="fm_calibration")
     p.add_argument("--talk", action="store_true")
     args = ap.parse_args()
-    if args.cmd == "eval" and args.protocol:
-        from protocol_utils import enforce_protocol, load_protocol
-        proto = load_protocol(args.protocol)
-        enforce_protocol(args, proto, override=args.override)
-        if args.manifest is None:
-            args.manifest = proto["test_manifest"]
-        if args.split is None:
-            args.split = proto["split"]
-        if args.n_waveforms is None:
-            args.n_waveforms = int(proto["n_waveforms_flagship"])
-        if args.n_steps is None:
-            args.n_steps = int(proto["n_steps"])
-        if args.batch_size is None:
-            args.batch_size = int(proto["batch_size"])
-        if args.context_fraction is None:
-            args.context_fraction = float(proto["context_fraction"])
-        if args.amp_mode is None:
-            args.amp_mode = proto["amp_mode"]
-        if args.seed is None:
-            args.seed = int(proto["seed"])
-    elif args.cmd == "eval" and args.amp_mode is None:
-        args.amp_mode = "constant"
     (run_eval if args.cmd == "eval" else run_plot)(args)

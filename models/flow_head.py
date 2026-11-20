@@ -80,7 +80,13 @@ class FlowMatchingHead(nn.Module):
     """Euler integration noise -> data.  The state is accumulated in fp32
     (20 bf16 additions on O(1) values lose real precision); the network is
     still evaluated in the ambient autocast dtype."""
-    x = temperature * torch.randn(cond.shape[0], patch_dim, device=cond.device, dtype=torch.float32)
+    x0 = temperature * torch.randn(cond.shape[0], patch_dim, device=cond.device, dtype=torch.float32)
+    return self.sample_from(x0, cond, n_steps)
+
+  @torch.no_grad()
+  def sample_from(self, x0: torch.Tensor, cond: torch.Tensor, n_steps: int) -> torch.Tensor:
+    """Same Euler loop as ``sample``, starting from a pre-drawn ``x0`` (fp32)."""
+    x = x0.float()
     dt = 1.0 / n_steps
     for i in range(n_steps):
       tau = torch.full((cond.shape[0],), i * dt, device=cond.device, dtype=cond.dtype)

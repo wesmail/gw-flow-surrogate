@@ -147,6 +147,64 @@ class CausalSelfAttention(nn.Module):
     out = out.transpose(1, 2).reshape(b, n, -1)
     return self.out(out), new_kv
 
+  def forward_static(
+    self,
+    x: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    pos: torch.Tensor,
+    attn_mask: torch.Tensor,
+  ) -> torch.Tensor:
+    """Single-token decode into a preallocated KV buffer (shape-static).
+
+    ``pos`` is a long tensor (0-d or shape (1,)) with the write index.
+    ``attn_mask`` is an additive float mask broadcastable to
+    (B, heads, 1, L) (0 = keep, -inf = block).  RoPE uses absolute ``pos``
+    via index_select (CUDA-graph friendly).  Caller must ensure the shared
+    RoPE cache covers ``pos``.
+    """
+    b, n, _ = x.shape
+    if n != 1:
+      raise ValueError("forward_static expects exactly one new token.")
+    q = self.q_proj(x).view(b, n, self.n_heads, self.head_dim).transpose(1, 2)
+    k = self.k_proj(x).view(b, n, self.n_kv_heads, self.head_dim).transpose(1, 2)
+    v = self.v_proj(x).view(b, n, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+    pos_i = pos.reshape(-1)
+    cos = self.rope.cos_cached.index_select(2, pos_i).to(q.dtype)
+    sin = self.rope.sin_cached.index_select(2, pos_i).to(q.dtype)
+    q = apply_rope(q, cos, sin)
+    k = apply_rope(k, cos, sin)
+
+    # k,v are (B, n_kv, 1, d); index_copy_ on dim 2 expects the same rank
+    k_cache.index_copy_(2, pos_i, k)
+    v_cache.index_copy_(2, pos_i, v)
+
+    # Full-buffer + mask: shape-static (compile / CUDAGraph).  Must NOT call
+    # ``.item()`` on this branch — that is data-dependent and breaks fullgraph.
+    # Eager slice [:pos+1]: bit-matches incremental ``torch.cat``.
+    use_full = bool(getattr(self, "_static_full_buffer", False))
+    if use_full:
+      kk, vv = k_cache, v_cache
+      mask = attn_mask
+    else:
+      end = int(pos_i[0].item()) + 1
+      kk = k_cache[:, :, :end]
+      vv = v_cache[:, :, :end]
+      mask = None
+
+    rep = self.n_heads // self.n_kv_heads
+    if rep > 1:
+      bk, nk, L, d = kk.shape
+      kk = kk[:, :, None].expand(bk, nk, rep, L, d).reshape(bk, nk * rep, L, d)
+      vv = vv[:, :, None].expand(bk, nk, rep, L, d).reshape(bk, nk * rep, L, d)
+
+    out = F.scaled_dot_product_attention(
+      q, kk, vv, attn_mask=mask, dropout_p=0.0, is_causal=False,
+    )
+    out = out.transpose(1, 2).reshape(b, n, -1)
+    return self.out(out)
+
 
 class AdaLNZeroBlock(nn.Module):
   """Pre-norm block with DiT-style adaLN-Zero conditioning on theta.
@@ -187,6 +245,22 @@ class AdaLNZeroBlock(nn.Module):
     h = self.norm2(x) * (1 + scale2.unsqueeze(1)) + shift2.unsqueeze(1)
     x = x + gate2.unsqueeze(1) * self.mlp(h)
     return x, new_kv
+
+  def forward_static(
+    self,
+    x: torch.Tensor,
+    cond: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    pos: torch.Tensor,
+    attn_mask: torch.Tensor,
+  ) -> torch.Tensor:
+    shift1, scale1, gate1, shift2, scale2, gate2 = self.ada(cond).chunk(6, dim=-1)
+    h = self.norm1(x) * (1 + scale1.unsqueeze(1)) + shift1.unsqueeze(1)
+    a = self.attn.forward_static(h, k_cache, v_cache, pos, attn_mask)
+    x = x + gate1.unsqueeze(1) * a
+    h = self.norm2(x) * (1 + scale2.unsqueeze(1)) + shift2.unsqueeze(1)
+    return x + gate2.unsqueeze(1) * self.mlp(h)
 
 
 class ParameterEncoder(nn.Module):

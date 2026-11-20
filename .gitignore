@@ -1,11 +1,14 @@
 # Large / regenerated artefacts
 data/
 logs/
+lightning_logs/
 scaling/
 *.ckpt
+*.pt
 *.h5
 *.hdf5
 *.npz
+*.parquet
 
 # Local env / caches
 .venv/
@@ -15,21 +18,26 @@ __pycache__/
 .pytest_cache/
 .benchmarks/
 .ipynb_checkpoints/
+nohup.out
 
-# Local outputs
+# Local outputs (figures, tables, PE runs)
 eval_test/
 figs/
 paper_figs/out/
-results/*.csv
+results/
+!results/protocol/
+!results/protocol/PROTOCOL.yaml
+!results/protocol/AUDIT.md
+!results/protocol/AMP_MODE_REPORT.md
 !results/prefreeze/
-results/scale_study/
-results/scaling/
-results/sampler/
-results/sampler_fine/
-results/sampler_low/
-results/protocol/*.log
-results/protocol/WORKLOG.md
-results/context_fraction_flagship.json
+!results/prefreeze/**
+*.png
+*.pdf
+*.svg
+*.csv
+
+# Third-party ASD files (download via asd/README.md); keep the README
+asd/*.txt
 
 # Scale-study local protocol (keep the .example committed)
 scripts/scale_study/PROTOCOL.env
